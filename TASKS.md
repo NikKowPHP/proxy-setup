@@ -2,4 +2,10 @@
 - [x] Refine DoT verification to handle different `resolvectl` output formats.
 - [x] Add debugging output to DoT check for better troubleshooting.
 - [x] Fix DNS routing loop by exempting DNS servers from the tunnel.
+- [x] Fix UDP DNS queries by adding policy-based routing exemptions.
+- [x] Create `stop_proxy.sh` for clean shutdown and restoration of settings.
+- [x] Configure `apt` to be proxy-aware when the tunnel is active.
+- [x] Add pre-run cleanup and process verification to `start_proxy.sh` for robustness.
+- [x] Correctly delete (not just deactivate) TUN device on start and stop.
+- [x] Force-reload TUN kernel module to fix persistent "device busy" errors.
       
