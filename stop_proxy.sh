@@ -7,6 +7,7 @@
 
 # --- Script Configuration ---
 VIRTUAL_TUN_DEVICE="tun0"
+VIRTUAL_TUN_IP="192.168.255.1"
 EXEMPT_TABLE=100 # Must match table number in start_proxy.sh
 
 # --- Pre-flight Checks ---
@@ -30,28 +31,29 @@ fi
 # --- 2. Restore Network Routing & Policy ---
 echo "Restoring original network routes and policies..."
 
-# Remove policy-based routing rules
 ip rule del fwmark 1 table $EXEMPT_TABLE &> /dev/null
 iptables -t mangle -F OUTPUT
 ip route flush table $EXEMPT_TABLE
 ip route flush cache
 echo "Policy routing rules removed."
 
-if [ -f /tmp/original_gateway.txt ] && [ -f /tmp/original_interface.txt ]; then
-    ORIGINAL_GATEWAY=$(cat /tmp/original_gateway.txt)
-    ORIGINAL_INTERFACE=$(cat /tmp/original_interface.txt)
+# Specifically delete the default route created by the start script
+ip route del default via $VIRTUAL_TUN_IP &> /dev/null
 
-    ip route del default > /dev/null 2>&1
-    if ! ip route | grep -q '^default'; then
+# Restore original default route if no default route exists
+if ! ip route | grep -q '^default'; then
+    if [ -f /tmp/original_gateway.txt ] && [ -f /tmp/original_interface.txt ]; then
+        ORIGINAL_GATEWAY=$(cat /tmp/original_gateway.txt)
+        ORIGINAL_INTERFACE=$(cat /tmp/original_interface.txt)
         ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE
+        echo "Original default route restored."
+    else
+        echo "WARNING: No default route present and original route files not found."
     fi
-
-    rm -f /tmp/original_gateway.txt
-    rm -f /tmp/original_interface.txt
-    echo "Routing restored."
-else
-    echo "Original gateway/interface files not found. Manual route restoration may be needed."
 fi
+
+rm -f /tmp/original_gateway.txt
+rm -f /tmp/original_interface.txt
 
 # --- 3. Decommission Virtual TUN device ---
 echo "Deleting virtual TUN device ($VIRTUAL_TUN_DEVICE)..."

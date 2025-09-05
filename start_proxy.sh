@@ -26,15 +26,14 @@ echo "--- Starting System-Wide Proxy Tunnel Setup ---"
 
 # --- 1. Pre-run Cleanup (for robustness) ---
 echo "Performing pre-run cleanup..."
-# Stop any lingering tun2socks process from a previous run
 if [ -f /tmp/tun2socks.pid ]; then
     kill $(cat /tmp/tun2socks.pid) &> /dev/null
     rm -f /tmp/tun2socks.pid
 fi
-# Delete the tun device if it exists from a failed shutdown
 ip link del $VIRTUAL_TUN_DEVICE &> /dev/null
-# Clean up any lingering policy routing rules
+# Clean up any lingering policy routing rules and tables
 ip rule del fwmark 1 table $EXEMPT_TABLE &> /dev/null
+ip route flush table $EXEMPT_TABLE &> /dev/null
 iptables -t mangle -F OUTPUT &> /dev/null
 echo "Cleanup complete."
 
@@ -51,7 +50,6 @@ fi
 # --- 3. Configure DNS for DNS-over-TLS (DoT) ---
 echo "Configuring DNS for DNS-over-TLS to bypass proxy DNS issues..."
 
-# Backup original configs if they haven't been backed up already
 [ ! -f /etc/systemd/resolved.conf.backup ] && cp /etc/systemd/resolved.conf /etc/systemd/resolved.conf.backup
 [ ! -f /etc/NetworkManager/NetworkManager.conf.backup ] && cp /etc/NetworkManager/NetworkManager.conf /etc/NetworkManager/NetworkManager.conf.backup
 
@@ -72,11 +70,11 @@ echo "Restarting network services..."
 systemctl restart NetworkManager
 systemctl restart systemd-resolved
 
-sleep 3 # Give services time to start
+sleep 3
 echo "Verifying DNS-over-TLS status..."
 if ! (resolvectl status | grep -q '+DNSOverTLS'); then
     echo "ERROR: Failed to activate DNS-over-TLS. Cannot continue."
-    resolvectl status # Show full status on failure
+    resolvectl status
     exit 1
 fi
 echo "DNS configured successfully."
@@ -91,7 +89,7 @@ echo "APT configured."
 
 # --- 5. Configure Policy-Based Routing for Exemptions ---
 echo "Configuring policy-based routing for exemptions..."
-DEFAULT_ROUTE_LINE=$(ip route | grep '^default')
+DEFAULT_ROUTE_LINE=$(ip route | grep '^default' | head -n 1)
 if [ -z "$DEFAULT_ROUTE_LINE" ]; then
     echo "ERROR: Could not determine default route. Cannot continue."
     exit 1
@@ -101,19 +99,16 @@ ORIGINAL_INTERFACE=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $5}')
 echo "$ORIGINAL_GATEWAY" > /tmp/original_gateway.txt
 echo "$ORIGINAL_INTERFACE" > /tmp/original_interface.txt
 
-# Create a new routing table that sends traffic out the physical interface
 ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE table $EXEMPT_TABLE
 
-# Mark packets destined for proxy or DNS servers
 iptables -t mangle -A OUTPUT -d $PROXY_IP -j MARK --set-mark 1
 for DNS_SERVER in $DNS_SERVERS; do
     echo "Exempting DNS server via policy route: $DNS_SERVER"
     iptables -t mangle -A OUTPUT -d $DNS_SERVER -j MARK --set-mark 1
 done
 
-# Use the new table for marked packets
 ip rule add fwmark 1 table $EXEMPT_TABLE
-ip route flush cache # Flush route cache to apply new rules
+ip route flush cache
 
 # --- 6. Start tun2socks and Configure Main Routing ---
 echo "Starting tun2socks process..."
@@ -130,7 +125,6 @@ echo "Configuring main routing table..."
 ip link set dev $VIRTUAL_TUN_DEVICE up
 ip addr replace ${VIRTUAL_TUN_IP}/24 dev $VIRTUAL_TUN_DEVICE
 
-# Change the default route for all non-exempt traffic
 ip route del default
 ip route add default via $VIRTUAL_TUN_IP
 

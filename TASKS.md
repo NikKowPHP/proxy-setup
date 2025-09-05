@@ -11,3 +11,4 @@
 - [x] Implement apt proxy configuration by creating /etc/apt/apt.conf.d/99proxy.conf.
 - [x] Fix "device or resource busy" error by properly deleting the TUN device on stop.
 - [x] Fix DNS leaks by implementing robust policy-based routing with iptables.
+- [x] Fix "duplicate" route error and improve script idempotency.
