@@ -14,6 +14,7 @@ VIRTUAL_TUN_DEVICE="tun0"
 VIRTUAL_TUN_IP="192.168.255.1"
 DNS_SERVERS="1.1.1.1 8.8.8.8"
 DNS_SERVERS_WITH_HOSTNAMES="1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google"
+EXEMPT_TABLE=100 # Routing table number for exemptions
 
 # --- Pre-flight Checks ---
 if [[ $EUID -ne 0 ]]; then
@@ -23,7 +24,21 @@ fi
 
 echo "--- Starting System-Wide Proxy Tunnel Setup ---"
 
-# --- 1. Install tun2socks (if not present) ---
+# --- 1. Pre-run Cleanup (for robustness) ---
+echo "Performing pre-run cleanup..."
+# Stop any lingering tun2socks process from a previous run
+if [ -f /tmp/tun2socks.pid ]; then
+    kill $(cat /tmp/tun2socks.pid) &> /dev/null
+    rm -f /tmp/tun2socks.pid
+fi
+# Delete the tun device if it exists from a failed shutdown
+ip link del $VIRTUAL_TUN_DEVICE &> /dev/null
+# Clean up any lingering policy routing rules
+ip rule del fwmark 1 table $EXEMPT_TABLE &> /dev/null
+iptables -t mangle -F OUTPUT &> /dev/null
+echo "Cleanup complete."
+
+# --- 2. Install tun2socks (if not present) ---
 if ! command -v tun2socks &> /dev/null; then
     echo "tun2socks not found. Installing gvisor-tun2socks..."
     wget -q --show-progress -O /tmp/tun2socks-linux-amd64 https://github.com/google/gvisor-tun2socks/releases/download/v0.6.0/tun2socks-linux-amd64
@@ -33,96 +48,93 @@ if ! command -v tun2socks &> /dev/null; then
     echo "tun2socks installed successfully."
 fi
 
-# --- 2. Configure DNS for DNS-over-TLS (DoT) ---
+# --- 3. Configure DNS for DNS-over-TLS (DoT) ---
 echo "Configuring DNS for DNS-over-TLS to bypass proxy DNS issues..."
 
 # Backup original configs if they haven't been backed up already
 [ ! -f /etc/systemd/resolved.conf.backup ] && cp /etc/systemd/resolved.conf /etc/systemd/resolved.conf.backup
 [ ! -f /etc/NetworkManager/NetworkManager.conf.backup ] && cp /etc/NetworkManager/NetworkManager.conf /etc/NetworkManager/NetworkManager.conf.backup
 
-# 1. Delete any existing DNS-related lines to avoid conflicts.
-sed -i -e '/^#?DNS=.*/d' \
-       -e '/^#?DNSOverTLS=.*/d' \
-       -e '/^#?DNSOverHTTPS=.*/d' \
-       /etc/systemd/resolved.conf
-
-# 2. Ensure the [Resolve] section header exists.
+sed -i -e '/^#?DNS=.*/d' -e '/^#?DNSOverTLS=.*/d' -e '/^#?DNSOverHTTPS=.*/d' /etc/systemd/resolved.conf
 if ! grep -q -E "^\s*\[Resolve\]" /etc/systemd/resolved.conf; then
-    echo "" >> /etc/systemd/resolved.conf
-    echo "[Resolve]" >> /etc/systemd/resolved.conf
+    echo -e "\n[Resolve]" >> /etc/systemd/resolved.conf
 fi
+sed -i "/\[Resolve\]/a DNS=${DNS_SERVERS_WITH_HOSTNAMES}\nDNSOverTLS=yes" /etc/systemd/resolved.conf
 
-# 3. Add the desired settings under the [Resolve] section.
-sed -i "/\[Resolve\]/a DNS=${DNS_SERVERS_WITH_HOSTNAMES}" /etc/systemd/resolved.conf
-sed -i "/\[Resolve\]/a DNSOverTLS=yes" /etc/systemd/resolved.conf
-
-# Configure NetworkManager to leave DNS alone
 if ! grep -q "dns=none" /etc/NetworkManager/NetworkManager.conf; then
     sed -i '/\[main\]/a dns=none' /etc/NetworkManager/NetworkManager.conf
 fi
 
-# Force resolv.conf to use the systemd stub resolver
 rm -f /etc/resolv.conf
 ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
-# Restart services to apply changes
 echo "Restarting network services..."
 systemctl restart NetworkManager
 systemctl restart systemd-resolved
 
-# Verify DoT is active
-sleep 3 # Give services time to start and establish a DoT connection
+sleep 3 # Give services time to start
 echo "Verifying DNS-over-TLS status..."
-GLOBAL_STATUS_OUTPUT=$(resolvectl status | grep -A 2 '^Global')
-if ! (echo "${GLOBAL_STATUS_OUTPUT}" | grep -q '+DNSOverTLS'); then
-    echo "ERROR: Failed to activate DNS-over-TLS. Verification check failed. Cannot continue."
-    echo "Full resolvectl status provided below for debugging:"
+if ! (resolvectl status | grep -q '+DNSOverTLS'); then
+    echo "ERROR: Failed to activate DNS-over-TLS. Cannot continue."
     resolvectl status # Show full status on failure
     exit 1
 fi
 echo "DNS configured successfully."
 
-# --- 3. Start tun2socks in the background ---
+# --- 4. Configure APT for Proxy ---
+echo "Configuring APT to use HTTP proxy..."
+cat > /etc/apt/apt.conf.d/99proxy.conf << EOL
+Acquire::http::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
+Acquire::https::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
+EOL
+echo "APT configured."
+
+# --- 5. Configure Policy-Based Routing for Exemptions ---
+echo "Configuring policy-based routing for exemptions..."
+DEFAULT_ROUTE_LINE=$(ip route | grep '^default')
+if [ -z "$DEFAULT_ROUTE_LINE" ]; then
+    echo "ERROR: Could not determine default route. Cannot continue."
+    exit 1
+fi
+ORIGINAL_GATEWAY=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $3}')
+ORIGINAL_INTERFACE=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $5}')
+echo "$ORIGINAL_GATEWAY" > /tmp/original_gateway.txt
+echo "$ORIGINAL_INTERFACE" > /tmp/original_interface.txt
+
+# Create a new routing table that sends traffic out the physical interface
+ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE table $EXEMPT_TABLE
+
+# Mark packets destined for proxy or DNS servers
+iptables -t mangle -A OUTPUT -d $PROXY_IP -j MARK --set-mark 1
+for DNS_SERVER in $DNS_SERVERS; do
+    echo "Exempting DNS server via policy route: $DNS_SERVER"
+    iptables -t mangle -A OUTPUT -d $DNS_SERVER -j MARK --set-mark 1
+done
+
+# Use the new table for marked packets
+ip rule add fwmark 1 table $EXEMPT_TABLE
+ip route flush cache # Flush route cache to apply new rules
+
+# --- 6. Start tun2socks and Configure Main Routing ---
 echo "Starting tun2socks process..."
+ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
 tun2socks -device "tun://$VIRTUAL_TUN_DEVICE" \
           -interface "$PHYSICAL_INTERFACE" \
           -proxy "http://$PROXY_IP:$PROXY_PORT" &
-
-# Save the Process ID (PID) so we can stop it later
 T2S_PID=$!
 echo $T2S_PID > /tmp/tun2socks.pid
 echo "tun2socks started with PID $T2S_PID."
-sleep 2 # Give the tun device time to be created
+sleep 2
 
-# --- 4. Configure System Routing ---
-echo "Configuring network routing table..."
-
-# Save original gateway for the stop script and for creating exemptions
-ip route | grep default | awk '{print $3}' > /tmp/original_gateway.txt
-ORIGINAL_GATEWAY=$(cat /tmp/original_gateway.txt)
-if [ -z "$ORIGINAL_GATEWAY" ]; then
-    echo "ERROR: Could not determine original gateway. Cannot create exemptions."
-    exit 1
-fi
-
-# Activate the virtual interface and assign IP. Use 'replace' to be idempotent.
+echo "Configuring main routing table..."
 ip link set dev $VIRTUAL_TUN_DEVICE up
 ip addr replace ${VIRTUAL_TUN_IP}/24 dev $VIRTUAL_TUN_DEVICE
 
-# Add specific routes for proxy and DNS to go out the physical device (prevents loop)
-# Using 'replace' is idempotent and avoids "File exists" errors on re-runs.
-echo "Adding route exemptions for proxy and DNS servers..."
-ip route replace $PROXY_IP via $ORIGINAL_GATEWAY
-for DNS_SERVER in $DNS_SERVERS; do
-    echo "Exempting DNS server: $DNS_SERVER"
-    ip route replace $DNS_SERVER via $ORIGINAL_GATEWAY
-done
-
-# Delete the old default route and add the new one via our tunnel
+# Change the default route for all non-exempt traffic
 ip route del default
 ip route add default via $VIRTUAL_TUN_IP
 
-# --- 5. Final Verification ---
+# --- 7. Final Verification ---
 echo ""
 echo "=========================================================="
 echo "          SUCCESS: PROXY TUNNEL IS NOW ACTIVE"
@@ -133,4 +145,3 @@ echo ""
 echo "Testing connection (Note: this may fail if proxy blocks 'curl' user-agent)..."
 curl -A "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/117.0" --connect-timeout 5 https://icanhazip.com || echo "Test failed, but tunnel may still be working for browsers."
 echo "To stop the tunnel, run: sudo ./stop_proxy.sh"
-      

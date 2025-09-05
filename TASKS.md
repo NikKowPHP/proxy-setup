@@ -8,4 +8,6 @@
 - [x] Add pre-run cleanup and process verification to `start_proxy.sh` for robustness.
 - [x] Correctly delete (not just deactivate) TUN device on start and stop.
 - [x] Force-reload TUN kernel module to fix persistent "device busy" errors.
-      
+- [x] Implement apt proxy configuration by creating /etc/apt/apt.conf.d/99proxy.conf.
+- [x] Fix "device or resource busy" error by properly deleting the TUN device on stop.
+- [x] Fix DNS leaks by implementing robust policy-based routing with iptables.
