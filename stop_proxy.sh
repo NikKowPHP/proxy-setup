@@ -9,6 +9,7 @@
 VIRTUAL_TUN_DEVICE="tun0"
 VIRTUAL_TUN_IP="192.168.255.1"
 EXEMPT_TABLE=100 # Must match table number in start_proxy.sh
+FWMARK=1         # Must match firewall mark in start_proxy.sh
 
 # --- Pre-flight Checks ---
 if [[ $EUID -ne 0 ]]; then
@@ -31,16 +32,17 @@ fi
 # --- 2. Restore Network Routing & Policy ---
 echo "Restoring original network routes and policies..."
 
-ip rule del fwmark 1 table $EXEMPT_TABLE &> /dev/null
+# STEP 1: Remove the routing rule, iptables marks, and flush the custom table.
+ip rule del fwmark $FWMARK table $EXEMPT_TABLE &> /dev/null
 iptables -t mangle -F OUTPUT
 ip route flush table $EXEMPT_TABLE
 ip route flush cache
 echo "Policy routing rules removed."
 
-# Specifically delete the default route created by the start script
+# STEP 2: Specifically delete the default route that points to our virtual tunnel.
 ip route del default via $VIRTUAL_TUN_IP &> /dev/null
 
-# Restore original default route if no default route exists
+# STEP 3: Restore the original default route if no other default route exists.
 if ! ip route | grep -q '^default'; then
     if [ -f /tmp/original_gateway.txt ] && [ -f /tmp/original_interface.txt ]; then
         ORIGINAL_GATEWAY=$(cat /tmp/original_gateway.txt)
@@ -51,9 +53,7 @@ if ! ip route | grep -q '^default'; then
         echo "WARNING: No default route present and original route files not found."
     fi
 fi
-
-rm -f /tmp/original_gateway.txt
-rm -f /tmp/original_interface.txt
+rm -f /tmp/original_gateway.txt /tmp/original_interface.txt
 
 # --- 3. Decommission Virtual TUN device ---
 echo "Deleting virtual TUN device ($VIRTUAL_TUN_DEVICE)..."
@@ -74,15 +74,12 @@ fi
 if [ -f /etc/NetworkManager/NetworkManager.conf.backup ]; then
     mv /etc/NetworkManager/NetworkManager.conf.backup /etc/NetworkManager/NetworkManager.conf
 fi
-
 echo "Restarting network services..."
-systemctl restart NetworkManager
-systemctl restart systemd-resolved
+systemctl restart NetworkManager && systemctl restart systemd-resolved
 echo "DNS configuration restored."
 
 # --- 6. Final Verification ---
-echo ""
-echo "=========================================================="
+echo -e "\n=========================================================="
 echo "          SUCCESS: PROXY TUNNEL IS DEACTIVATED"
 echo "=========================================================="
 echo "Your default route is now:"

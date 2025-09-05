@@ -1,14 +1,18 @@
-- [x] Fix DNS-over-TLS activation failure in `start_proxy.sh`.
-- [x] Refine DoT verification to handle different `resolvectl` output formats.
-- [x] Add debugging output to DoT check for better troubleshooting.
-- [x] Fix DNS routing loop by exempting DNS servers from the tunnel.
-- [x] Fix UDP DNS queries by adding policy-based routing exemptions.
-- [x] Create `stop_proxy.sh` for clean shutdown and restoration of settings.
+# Proxy Tunnel Scripts Task List
+
+## Core Functionality
+- [x] Create `start_proxy.sh` to establish a system-wide tunnel with `tun2socks`.
+- [x] Create `stop_proxy.sh` for a clean shutdown and restoration of network settings.
+- [x] Configure DNS-over-TLS to prevent DNS leaks through the proxy.
+
+## Bug Fixes & Robustness
+- [x] Fix DNS traffic being incorrectly routed via the proxy by implementing policy-based routing.
+- [x] Fix application hangs (e.g., `apt`) by enabling the `tun2socks` DNS fallback proxy.
+- [x] Add pre-run cleanup to `start_proxy.sh` to make it robust against previous failures.
+- [x] Ensure the virtual `tun` device is properly deleted on both start and stop to prevent "device busy" errors.
+- [x] Improve script idempotency to prevent "duplicate route" errors on subsequent runs.
+
+## Features & Utilities
 - [x] Configure `apt` to be proxy-aware when the tunnel is active.
-- [x] Add pre-run cleanup and process verification to `start_proxy.sh` for robustness.
-- [x] Correctly delete (not just deactivate) TUN device on start and stop.
-- [x] Force-reload TUN kernel module to fix persistent "device busy" errors.
-- [x] Implement apt proxy configuration by creating /etc/apt/apt.conf.d/99proxy.conf.
-- [x] Fix "device or resource busy" error by properly deleting the TUN device on stop.
-- [x] Fix DNS leaks by implementing robust policy-based routing with iptables.
-- [x] Fix "duplicate" route error and improve script idempotency.
+- [x] Add detailed comments and variables to improve script readability and maintainability.
+- [x] Create a troubleshooting script to fix common `apt` GPG key errors, force HTTPS, and disable incompatible repositories.
