@@ -1,15 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-#             TUN2SOCKS - System-Wide Proxy Tunnel Stop Script
+#           TUN2SOCKS - System-Wide Proxy Tunnel Stop Script
 # ==============================================================================
-# This script restores all network and DNS settings to their original state.
+# This script reverts all changes made by start_proxy.sh.
 
 # --- Script Configuration ---
 VIRTUAL_TUN_DEVICE="tun0"
-VIRTUAL_TUN_IP="192.168.255.1"
-EXEMPT_TABLE=100 # Must match table number in start_proxy.sh
-FWMARK=1         # Must match firewall mark in start_proxy.sh
+EXEMPT_TABLE=100
+FWMARK=1
 
 # --- Pre-flight Checks ---
 if [[ $EUID -ne 0 ]]; then
@@ -19,54 +18,41 @@ fi
 
 echo "--- Stopping System-Wide Proxy Tunnel ---"
 
-# --- 1. Stop the tun2socks process ---
+# --- 1. Kill tun2socks ---
 if [ -f /tmp/tun2socks.pid ]; then
-    T2S_PID=$(cat /tmp/tun2socks.pid)
-    echo "Stopping tun2socks process (PID $T2S_PID)..."
-    kill $T2S_PID &> /dev/null
+    echo "Stopping tun2socks process..."
+    kill $(cat /tmp/tun2socks.pid) &> /dev/null
     rm -f /tmp/tun2socks.pid
 else
-    echo "Could not find tun2socks PID file. It may already be stopped."
+    echo "tun2socks PID file not found. It might already be stopped."
 fi
 
-# --- 2. Restore Network Routing & Policy ---
-echo "Restoring original network routes and policies..."
+# --- 2. Restore Routing ---
+echo "Restoring original network routes..."
+if [ -f /tmp/original_gateway.txt ] && [ -f /tmp/original_interface.txt ]; then
+    ORIGINAL_GATEWAY=$(cat /tmp/original_gateway.txt)
+    ORIGINAL_INTERFACE=$(cat /tmp/original_interface.txt)
+    ip route del default &> /dev/null
+    ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE
+    rm -f /tmp/original_gateway.txt /tmp/original_interface.txt
+    echo "Default route restored."
+else
+    echo "WARNING: Original gateway information not found. You may need to restore the default route manually."
+    echo "Example: sudo ip route add default via <YOUR_GATEWAY_IP> dev <YOUR_INTERFACE>"
+fi
 
-# STEP 1: Remove the routing rule, iptables marks, and flush the custom table.
+# --- 3. Remove Policy Routing and Firewall Rules ---
+echo "Removing policy routing rules and iptables marks..."
 ip rule del fwmark $FWMARK table $EXEMPT_TABLE &> /dev/null
-iptables -t mangle -F OUTPUT
-ip route flush table $EXEMPT_TABLE
+ip route flush table $EXEMPT_TABLE &> /dev/null
+iptables -t mangle -F OUTPUT &> /dev/null
 ip route flush cache
-echo "Policy routing rules removed."
 
-# STEP 2: Specifically delete the default route that points to our virtual tunnel.
-ip route del default via $VIRTUAL_TUN_IP &> /dev/null
+# --- 4. Remove Virtual Device ---
+echo "Deleting virtual network device..."
+ip link del $VIRTUAL_TUN_DEVICE &> /dev/null
 
-# STEP 3: Restore the original default route if no other default route exists.
-if ! ip route | grep -q '^default'; then
-    if [ -f /tmp/original_gateway.txt ] && [ -f /tmp/original_interface.txt ]; then
-        ORIGINAL_GATEWAY=$(cat /tmp/original_gateway.txt)
-        ORIGINAL_INTERFACE=$(cat /tmp/original_interface.txt)
-        ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE
-        echo "Original default route restored."
-    else
-        echo "WARNING: No default route present and original route files not found."
-    fi
-fi
-rm -f /tmp/original_gateway.txt /tmp/original_interface.txt
-
-# --- 3. Decommission Virtual TUN device ---
-echo "Deleting virtual TUN device ($VIRTUAL_TUN_DEVICE)..."
-ip link set dev $VIRTUAL_TUN_DEVICE down &> /dev/null
-ip tuntap del dev $VIRTUAL_TUN_DEVICE mode tun &> /dev/null
-echo "TUN device deleted."
-
-# --- 4. Restore APT Configuration ---
-echo "Removing APT proxy configuration..."
-rm -f /etc/apt/apt.conf.d/99proxy.conf
-echo "APT configuration restored."
-
-# --- 5. Restore DNS and NetworkManager Configuration ---
+# --- 5. Restore Original DNS Settings ---
 echo "Restoring original DNS configuration..."
 if [ -f /etc/systemd/resolved.conf.backup ]; then
     mv /etc/systemd/resolved.conf.backup /etc/systemd/resolved.conf
@@ -74,13 +60,14 @@ fi
 if [ -f /etc/NetworkManager/NetworkManager.conf.backup ]; then
     mv /etc/NetworkManager/NetworkManager.conf.backup /etc/NetworkManager/NetworkManager.conf
 fi
-echo "Restarting network services..."
+echo "Restarting network services to apply DNS changes..."
 systemctl restart NetworkManager && systemctl restart systemd-resolved
-echo "DNS configuration restored."
+echo "DNS settings restored."
 
-# --- 6. Final Verification ---
-echo -e "\n=========================================================="
-echo "          SUCCESS: PROXY TUNNEL IS DEACTIVATED"
-echo "=========================================================="
-echo "Your default route is now:"
-ip route | head -n 1
+# --- 6. Restore APT settings ---
+if [ -f /etc/apt/apt.conf.d/99proxy.conf ]; then
+    rm -f /etc/apt/apt.conf.d/99proxy.conf
+    echo "APT proxy configuration removed."
+fi
+
+echo -e "\n--- Proxy Tunnel Deactivated ---"

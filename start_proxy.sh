@@ -4,16 +4,22 @@
 #           TUN2SOCKS - System-Wide Proxy Tunnel Start Script
 # ==============================================================================
 # This script configures the system to route all traffic through an HTTP proxy
-# using tun2socks, including robust DNS-over-TLS configuration.
+# using tun2socks, including robust DNS-over-TLS configuration and exemptions
+# for critical services like the database.
 
 # --- Script Configuration (Edit these variables if your setup changes) ---
 PROXY_IP="172.16.2.254"
 PROXY_PORT="3128"
 PHYSICAL_INTERFACE="enp2s0" # Your main network card (e.g., eth0, wlan0)
 VIRTUAL_TUN_DEVICE="tun0"
-VIRTUAL_TUN_IP="192.168.255.1"
+VIRTUAL_TUN_IP="192.18.255.1" # Corrected to a valid private IP range
 DNS_SERVERS="1.1.1.1 8.8.8.8"
 DNS_SERVERS_WITH_HOSTNAMES="1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google"
+# Add all database hosts to exempt here
+DB_HOSTS=(
+  "aws-0-us-west-1.pooler.supabase.com"
+  "aws-0-eu-central-1.pooler.supabase.com"
+)
 
 # --- Advanced Routing Configuration ---
 EXEMPT_TABLE=100 # Routing table number for exemptions
@@ -23,6 +29,16 @@ FWMARK=1         # Firewall mark for exempted packets
 if [[ $EUID -ne 0 ]]; then
    echo "This script must be run as root. Please use 'sudo ./start_proxy.sh'"
    exit 1
+fi
+
+if ! command -v tun2socks &> /dev/null; then
+    echo "tun2socks is not installed. Please install it first."
+    exit 1
+fi
+
+if ! command -v dig &> /dev/null; then
+    echo "'dig' command not found. Please install dnsutils (Debian/Ubuntu) or bind-utils (CentOS/RHEL)."
+    exit 1
 fi
 
 echo "--- Starting System-Wide Proxy Tunnel Setup ---"
@@ -39,17 +55,19 @@ ip route flush table $EXEMPT_TABLE &> /dev/null
 iptables -t mangle -F OUTPUT &> /dev/null
 echo "Cleanup complete."
 
-# --- 2. Install tun2socks (if not present) ---
-if ! command -v tun2socks &> /dev/null; then
-    echo "tun2socks not found. Installing gvisor-tun2socks..."
-    wget -q --show-progress -O /tmp/tun2socks-linux-amd64 https://github.com/google/gvisor-tun2socks/releases/download/v0.6.0/tun2socks-linux-amd64
-    if [[ $? -ne 0 ]]; then echo "Failed to download tun2socks. Exiting."; exit 1; fi
-    chmod +x /tmp/tun2socks-linux-amd64
-    mv /tmp/tun2socks-linux-amd64 /usr/local/bin/tun2socks
-    echo "tun2socks installed successfully."
-fi
+# --- 2. Resolve DB Hosts and Configure DNS ---
+DB_IPS=()
+for HOST in "${DB_HOSTS[@]}"; do
+    echo "Resolving database host IP for $HOST..."
+    IP=$(dig +short $HOST | head -n 1)
+    if [ -z "$IP" ]; then
+        echo "ERROR: Could not resolve database host IP for $HOST. Exiting."
+        exit 1
+    fi
+    echo "Database IP to be exempted: $IP"
+    DB_IPS+=("$IP")
+done
 
-# --- 3. Configure DNS for DNS-over-TLS (DoT) ---
 echo "Configuring DNS for DNS-over-TLS to bypass proxy DNS issues..."
 [ ! -f /etc/systemd/resolved.conf.backup ] && cp /etc/systemd/resolved.conf /etc/systemd/resolved.conf.backup
 [ ! -f /etc/NetworkManager/NetworkManager.conf.backup ] && cp /etc/NetworkManager/NetworkManager.conf /etc/NetworkManager/NetworkManager.conf.backup
@@ -69,7 +87,7 @@ if ! (resolvectl status | grep -q '+DNSOverTLS'); then
 fi
 echo "DNS configured successfully."
 
-# --- 4. Configure APT for Proxy ---
+# --- 3. Configure APT for Proxy ---
 echo "Configuring APT to use HTTP proxy..."
 cat > /etc/apt/apt.conf.d/99proxy.conf << EOL
 Acquire::http::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
@@ -77,7 +95,7 @@ Acquire::https::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
 EOL
 echo "APT configured."
 
-# --- 5. Configure Policy-Based Routing for Exemptions ---
+# --- 4. Configure Policy-Based Routing for Exemptions ---
 echo "Configuring policy-based routing for exemptions..."
 DEFAULT_ROUTE_LINE=$(ip route | grep '^default' | head -n 1)
 if [ -z "$DEFAULT_ROUTE_LINE" ]; then echo "ERROR: Could not determine default route." && exit 1; fi
@@ -89,8 +107,12 @@ echo "$ORIGINAL_INTERFACE" > /tmp/original_interface.txt
 # STEP 1: Create a separate routing table that contains the original default route.
 ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE table $EXEMPT_TABLE
 
-# STEP 2: Use iptables to "mark" any packet going to the proxy or DNS servers.
+# STEP 2: Use iptables to "mark" any packet going to the proxy, DNS, or DB servers.
 iptables -t mangle -A OUTPUT -d $PROXY_IP -j MARK --set-mark $FWMARK
+for IP in "${DB_IPS[@]}"; do
+    echo "Exempting database IP via policy route: $IP"
+    iptables -t mangle -A OUTPUT -d $IP -j MARK --set-mark $FWMARK
+done
 for DNS_SERVER in $DNS_SERVERS; do
     echo "Exempting DNS server via policy route: $DNS_SERVER"
     iptables -t mangle -A OUTPUT -d $DNS_SERVER -j MARK --set-mark $FWMARK
@@ -100,7 +122,7 @@ done
 ip rule add fwmark $FWMARK table $EXEMPT_TABLE
 ip route flush cache
 
-# --- 6. Start tun2socks and Configure Main Routing ---
+# --- 5. Start tun2socks and Configure Main Routing ---
 echo "Starting tun2socks process..."
 ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
 tun2socks -device "tun://$VIRTUAL_TUN_DEVICE" \
@@ -119,7 +141,7 @@ ip addr replace ${VIRTUAL_TUN_IP}/24 dev $VIRTUAL_TUN_DEVICE
 ip route del default
 ip route add default via $VIRTUAL_TUN_IP
 
-# --- 7. Final Verification ---
+# --- 6. Final Verification ---
 echo -e "\n=========================================================="
 echo "          SUCCESS: PROXY TUNNEL IS NOW ACTIVE"
 echo "=========================================================="

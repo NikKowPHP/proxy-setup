@@ -1,18 +1,15 @@
-# Proxy Tunnel Scripts Task List
-
-## Core Functionality
-- [x] Create `start_proxy.sh` to establish a system-wide tunnel with `tun2socks`.
-- [x] Create `stop_proxy.sh` for a clean shutdown and restoration of network settings.
-- [x] Configure DNS-over-TLS to prevent DNS leaks through the proxy.
-
-## Bug Fixes & Robustness
-- [x] Fix DNS traffic being incorrectly routed via the proxy by implementing policy-based routing.
-- [x] Fix application hangs (e.g., `apt`) by enabling the `tun2socks` DNS fallback proxy.
-- [x] Add pre-run cleanup to `start_proxy.sh` to make it robust against previous failures.
-- [x] Ensure the virtual `tun` device is properly deleted on both start and stop to prevent "device busy" errors.
-- [x] Improve script idempotency to prevent "duplicate route" errors on subsequent runs.
-
-## Features & Utilities
-- [x] Configure `apt` to be proxy-aware when the tunnel is active.
-- [x] Add detailed comments and variables to improve script readability and maintainability.
-- [x] Create a troubleshooting script to fix common `apt` GPG key errors, force HTTPS, and disable incompatible repositories.
+- [x] Make font size of subtitle similar to description text on the homepage.
+- [x] Redesign results page to match homepage layout.
+- [x] Redesign static pages (Terms, Privacy, Cookies) to match homepage layout.
+- [x] Fix mobile UI issues on homepage (centering, sticky footer, upward-expanding disclaimer).
+- [x] Make the footer fixed on mobile for the results page.
+- [x] Make homepage content area full viewport on mobile.
+- [x] Remove footer from static pages to match user request.
+- [x] Match static page left panel/mobile header background to homepage.
+- [x] Add "go back" buttons to static and results pages.
+- [x] Make assessment steps mobile layout consistent with homepage (centered, full viewport).
+- [x] Make results page loading state consistent with homepage layout (centered, full viewport).
+- [x] Make static pages have a 50/50 split on desktop.
+- [x] Delay autofocus on mobile email dialog.
+- [x] Troubleshoot and fix database connection issue caused by proxy script.
+- [x] Add second database host to proxy exemption script.
