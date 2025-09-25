@@ -13,3 +13,10 @@
 - [x] Delay autofocus on mobile email dialog.
 - [x] Troubleshoot and fix database connection issue caused by proxy script.
 - [x] Add second database host to proxy exemption script.
+- [x] Fix proxy script failing on reboot due to CNAME resolution.
+- [x] Diagnose and fix proxy script failure due to CNAME resolution.
+- [x] Create network diagnostic script and improve proxy script robustness.
+- [x] Fix multiple default routes issue and improve diagnostic script.
+- [x] Make diagnostic script more robust (check for active proxy, check for dependencies).
+- [x] Fix critical typo in start_proxy.sh that prevented tun0 activation.
+      

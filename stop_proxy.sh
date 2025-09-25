@@ -7,6 +7,7 @@
 
 # --- Script Configuration ---
 VIRTUAL_TUN_DEVICE="tun0"
+VIRTUAL_TUN_IP="10.192.0.1"
 EXEMPT_TABLE=100
 FWMARK=1
 
@@ -32,7 +33,8 @@ echo "Restoring original network routes..."
 if [ -f /tmp/original_gateway.txt ] && [ -f /tmp/original_interface.txt ]; then
     ORIGINAL_GATEWAY=$(cat /tmp/original_gateway.txt)
     ORIGINAL_INTERFACE=$(cat /tmp/original_interface.txt)
-    ip route del default &> /dev/null
+    # Be specific about which default route to delete
+    ip route del default via $VIRTUAL_TUN_IP &> /dev/null
     ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE
     rm -f /tmp/original_gateway.txt /tmp/original_interface.txt
     echo "Default route restored."
@@ -71,3 +73,4 @@ if [ -f /etc/apt/apt.conf.d/99proxy.conf ]; then
 fi
 
 echo -e "\n--- Proxy Tunnel Deactivated ---"
+      
