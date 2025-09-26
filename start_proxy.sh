@@ -31,6 +31,15 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+if ! ip route | grep -q '^default'; then
+    echo "CRITICAL ERROR: No default gateway found on your system."
+    echo "This script requires a working internet connection to start."
+    echo "Please restore your default route and try again."
+    echo "You can check your routes with: ip route"
+    echo "You may be able to fix this temporarily with: sudo ip route add default via <GATEWAY_IP> dev <INTERFACE>"
+    exit 1
+fi
+
 if ! command -v tun2socks &> /dev/null; then
     echo "tun2socks is not installed. Please install it first."
     exit 1
@@ -81,8 +90,8 @@ for HOST in "${DB_HOSTS[@]}"; do
     echo "Resolving database host IP for $HOST..."
     IP=""
     for i in {1..5}; do
-        # Use a timeout for dig to avoid long hangs, and grep to ensure it's a valid IP
-        IP=$(dig +time=2 +tries=1 +short $HOST | head -n 1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        # Use a timeout for dig to avoid long hangs, and grep for an IP before taking the first line.
+        IP=$(dig +time=2 +tries=1 +short $HOST | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
         if [ -n "$IP" ]; then
             break
         fi

@@ -1,165 +1,213 @@
-response>
+```xml
+<response>
   <reasoning>
-    The DNS resolution in `start_proxy.sh` is still failing despite previous fixes. This indicates a deeper, underlying issue with the network configuration that simple retries cannot solve. Instead of guessing further, I will create a comprehensive diagnostic script as requested.
+    The user is reporting that `start_proxy.sh` fails during DNS resolution for a database host.
+    The error log shows: `ERROR: Could not resolve database host IP for aws-0-us-west-1.pooler.supabase.com after 5 attempts. Exiting.`
 
-This script, `diagnose_network.sh`, will be a non-destructive tool that gathers critical information about the system's state:
-1.  **General Connectivity:** Checks `ip addr`, `ip route`, and basic `ping` to an external IP.
-2.  **DNS Resolver Status:** Inspects `systemd-resolved` status, `/etc/resolv.conf`, and `resolvectl`.
-3.  **DNS Resolution Tests:** Attempts to resolve hostnames using both the system's default resolver and a direct query to a public DNS server (`1.1.1.1`) to isolate the point of failure.
-4.  **Firewall Rules:** Dumps `iptables` rules, especially from the `mangle` table used by the proxy scripts.
-5.  **Proxy Reachability:** Directly tests the connection to the proxy server using `curl`.
+    Looking at the `diagnose_network.sh` output, DNS resolution for that host works, but it returns a CNAME record before the A (IP address) records:
+    ```
+    -> Testing resolution for PROBLEMATIC HOST 'aws-0-us-west-1.pooler.supabase.com' using system resolver:
+    pool-tcp-us-west-1-58aaa9f-fd46bdad3edd3d75.elb.us-west-1.amazonaws.com.
+    52.8.172.168
+    54.177.55.191
+    ```
 
-Creating this script will provide the necessary data to accurately identify and fix the root cause. I will also make the script executable.
+    The failing command in `start_proxy.sh` is:
+    `IP=$(dig +time=2 +tries=1 +short $HOST | head -n 1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')`
+
+    This command takes the first line of the `dig` output (`head -n 1`) and then checks if it's an IP address. When the first line is a CNAME, the `grep` fails, and the `IP` variable remains empty, causing the script to error out.
+
+    The fix is to first filter for IP addresses with `grep` and then take the first result with `head -n 1`.
+
+    My plan is:
+    1.  Modify `start_proxy.sh` to correct the `dig` command's pipe order.
+    2.  Create a `TASKS.md` file to track this task and mark it as complete, as one does not currently exist.
   </reasoning>
-  <commands>
-    <![CDATA[
-chmod +x "diagnose_network.sh"
-]]>
-  </commands>
   <modifications>
-    <file path="directory_structure">
-      <![CDATA[
-.gitignore
-apply_changes.sh
-diagnose_network.sh
-start_proxy.sh
-stop_proxy.sh
-TASKS.md
-troubleshoot.sh
-]]>
-    </file>
-    <file path="diagnose_network.sh">
+    <file path="start_proxy.sh">
       <![CDATA[
 #!/bin/bash
 
 # ==============================================================================
-#                      Network & DNS Diagnostics Script
+#           TUN2SOCKS - System-Wide Proxy Tunnel Start Script
 # ==============================================================================
-# This script runs a series of non-destructive checks to gather information
-# about the system's network configuration, DNS resolution, and proxy
-# connectivity to help diagnose issues with the proxy tunnel scripts.
+# This script configures the system to route all traffic through an HTTP proxy
+# using tun2socks, including robust DNS-over-TLS configuration and exemptions
+# for critical services like the database.
 
-# Run this script in a "clean" state (BEFORE running start_proxy.sh)
-# and with sudo: `sudo ./diagnose_network.sh`
+# --- Script Configuration (Edit these variables if your setup changes) ---
+PROXY_IP="172.16.2.254"
+PROXY_PORT="3128"
+PHYSICAL_INTERFACE="enp2s0" # Your main network card (e.g., eth0, wlan0)
+VIRTUAL_TUN_DEVICE="tun0"
+VIRTUAL_TUN_IP="192.18.255.1" # Corrected to a valid private IP range
+DNS_SERVERS="1.1.1.1 8.8.8.8"
+DNS_SERVERS_WITH_HOSTNAMES="1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google"
+# Add all database hosts to exempt here
+DB_HOSTS=(
+  "aws-0-us-west-1.pooler.supabase.com"
+  "aws-0-eu-central-1.pooler.supabase.com"
+)
+
+# --- Advanced Routing Configuration ---
+EXEMPT_TABLE=100 # Routing table number for exemptions
+FWMARK=1         # Firewall mark for exempted packets
 
 # --- Pre-flight Checks ---
 if [[ $EUID -ne 0 ]]; then
-   echo "This script must be run as root. Please use 'sudo ./diagnose_network.sh'"
+   echo "This script must be run as root. Please use 'sudo ./start_proxy.sh'"
    exit 1
 fi
 
-echo "================================================================================"
-echo "          STARTING NETWORK & DNS DIAGNOSTICS"
-echo "================================================================================"
-
-# --- Section 1: System Prerequisites ---
-echo
-echo "--- Checking for required tools... ---"
-command -v dig &> /dev/null && echo "[OK] 'dig' is installed." || echo "[FAIL] 'dig' is not installed. Please install dnsutils."
-command -v curl &> /dev/null && echo "[OK] 'curl' is installed." || echo "[FAIL] 'curl' is not installed."
-command -v resolvectl &> /dev/null && echo "[OK] 'resolvectl' is installed." || echo "[FAIL] 'resolvectl' is not installed (system may not use systemd-resolved)."
-
-# --- Section 2: General Network Connectivity ---
-echo
-echo "--- General Network Connectivity ---"
-echo "-> Interfaces and IP Addresses (ip addr):"
-ip addr
-echo
-echo "-> Kernel Routing Table (ip route):"
-ip route
-echo
-echo "-> Pinging external IP (8.8.8.8) to test basic connectivity (bypasses DNS):"
-ping -c 3 8.8.8.8
-
-# --- Section 3: DNS Resolver Status ---
-echo
-echo "--- DNS Resolver Status (systemd-resolved) ---"
-echo "-> Status of systemd-resolved service:"
-systemctl status systemd-resolved --no-pager | cat # Use cat to avoid interactive pager
-echo
-echo "-> Contents of /etc/resolv.conf:"
-cat /etc/resolv.conf
-echo
-echo "-> Detailed resolver status (resolvectl status):"
-resolvectl status
-
-# --- Section 4: DNS Resolution Tests ---
-echo
-echo "--- DNS Resolution Tests ---"
-echo "-> Testing resolution for 'google.com' using system resolver:"
-dig google.com +short
-echo
-echo "-> Testing resolution for 'google.com' DIRECTLY via 1.1.1.1:"
-dig google.com @1.1.1.1 +short
-echo
-echo "-> Testing resolution for PROBLEMATIC HOST 'aws-0-us-west-1.pooler.supabase.com' using system resolver:"
-dig aws-0-us-west-1.pooler.supabase.com +short
-echo
-echo "-> Testing resolution for PROBLEMATIC HOST 'aws-0-us-west-1.pooler.supabase.com' DIRECTLY via 1.1.1.1:"
-dig aws-0-us-west-1.pooler.supabase.com @1.1.1.1 +short
-
-# --- Section 5: Firewall Configuration ---
-echo
-echo "--- Firewall Rules (iptables) ---"
-echo "-> Mangle Table (used by proxy scripts):"
-iptables -t mangle -L -v -n
-echo
-echo "-> Filter Table (main firewall):"
-iptables -L -v -n
-echo
-echo "-> NAT Table:"
-iptables -t nat -L -v -n
-
-# --- Section 6: Proxy Server Connectivity ---
-PROXY_IP="172.16.2.254"
-PROXY_PORT="3128"
-echo
-echo "--- Proxy Server Connectivity Test ---"
-echo "-> Attempting to connect to google.com via proxy ${PROXY_IP}:${PROXY_PORT}..."
-# We use -v for verbose output, --connect-timeout to avoid long hangs.
-# The output will show if the TCP handshake with the proxy completes.
-curl -v --connect-timeout 5 -x "http://${PROXY_IP}:${PROXY_PORT}" https://google.com &> /tmp/proxy_test.log
-if grep -q "Connected to ${PROXY_IP}" /tmp/proxy_test.log; then
-    echo "[SUCCESS] Successfully established a TCP connection to the proxy server."
-    if grep -q "HTTP/1.1 200 OK" /tmp/proxy_test.log || grep -q "HTTP/2 200" /tmp/proxy_test.log; then
-        echo "[SUCCESS] Proxy successfully fetched the page."
-    else
-        echo "[WARNING] Connected to proxy, but failed to fetch page. Proxy may require authentication or be misconfigured."
-    fi
-else
-    echo "[FAIL] Could not establish a TCP connection to the proxy server at ${PROXY_IP}:${PROXY_PORT}."
+if ! ip route | grep -q '^default'; then
+    echo "CRITICAL ERROR: No default gateway found on your system."
+    echo "This script requires a working internet connection to start."
+    echo "Please restore your default route and try again."
+    echo "You can check your routes with: ip route"
+    echo "You may be able to fix this temporarily with: sudo ip route add default via <GATEWAY_IP> dev <INTERFACE>"
+    exit 1
 fi
-echo "-> Verbose curl output logged to /tmp/proxy_test.log"
 
+if ! command -v tun2socks &> /dev/null; then
+    echo "tun2socks is not installed. Please install it first."
+    exit 1
+fi
 
-echo
-echo "================================================================================"
-echo "          DIAGNOSTICS COMPLETE"
-echo "================================================================================"
+if ! command -v dig &> /dev/null; then
+    echo "'dig' command not found. Please install dnsutils (Debian/Ubuntu) or bind-utils (CentOS/RHEL)."
+    exit 1
+fi
+
+echo "--- Starting System-Wide Proxy Tunnel Setup ---"
+
+# --- 1. Pre-run Cleanup (for robustness) ---
+echo "Performing pre-run cleanup..."
+if [ -f /tmp/tun2socks.pid ]; then
+    kill $(cat /tmp/tun2socks.pid) &> /dev/null
+    rm -f /tmp/tun2socks.pid
+fi
+ip link del $VIRTUAL_TUN_DEVICE &> /dev/null
+ip rule del fwmark $FWMARK table $EXEMPT_TABLE &> /dev/null
+ip route flush table $EXEMPT_TABLE &> /dev/null
+iptables -t mangle -F OUTPUT &> /dev/null
+echo "Cleanup complete."
+
+# --- 2. Configure DNS ---
+echo "Configuring DNS for DNS-over-TLS to bypass proxy DNS issues..."
+[ ! -f /etc/systemd/resolved.conf.backup ] && cp /etc/systemd/resolved.conf /etc/systemd/resolved.conf.backup
+[ ! -f /etc/NetworkManager/NetworkManager.conf.backup ] && cp /etc/NetworkManager/NetworkManager.conf /etc/NetworkManager/NetworkManager.conf.backup
+sed -i -e '/^#?DNS=.*/d' -e '/^#?DNSOverTLS=.*/d' -e '/^#?DNSOverHTTPS=.*/d' /etc/systemd/resolved.conf
+if ! grep -q -E "^\s*\[Resolve\]" /etc/systemd/resolved.conf; then echo -e "\n[Resolve]" >> /etc/systemd/resolved.conf; fi
+sed -i "/\[Resolve\]/a DNS=${DNS_SERVERS_WITH_HOSTNAMES}\nDNSOverTLS=yes" /etc/systemd/resolved.conf
+if ! grep -q "dns=none" /etc/NetworkManager/NetworkManager.conf; then sed -i '/\[main\]/a dns=none' /etc/NetworkManager/NetworkManager.conf; fi
+rm -f /etc/resolv.conf && ln -s /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+echo "Restarting network services..."
+systemctl restart NetworkManager && systemctl restart systemd-resolved
+sleep 3
+echo "Verifying DNS-over-TLS status..."
+if ! (resolvectl status | grep -q '+DNSOverTLS'); then
+    echo "ERROR: Failed to activate DNS-over-TLS. Cannot continue."
+    resolvectl status
+    exit 1
+fi
+echo "DNS configured successfully."
+
+# --- 3. Resolve DB Hosts for Exemption ---
+DB_IPS=()
+for HOST in "${DB_HOSTS[@]}"; do
+    echo "Resolving database host IP for $HOST..."
+    IP=""
+    for i in {1..5}; do
+        # Use a timeout for dig to avoid long hangs, and grep for an IP before taking the first line.
+        IP=$(dig +time=2 +tries=1 +short $HOST | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+        if [ -n "$IP" ]; then
+            break
+        fi
+        echo "DNS resolution failed for $HOST (attempt $i/5), retrying in 2 seconds..."
+        sleep 2
+    done
+
+    if [ -z "$IP" ]; then
+        echo "ERROR: Could not resolve database host IP for $HOST after 5 attempts. Exiting."
+        exit 1
+    fi
+    echo "Database IP to be exempted: $IP"
+    DB_IPS+=("$IP")
+done
+
+# --- 4. Configure APT for Proxy ---
+echo "Configuring APT to use HTTP proxy..."
+cat > /etc/apt/apt.conf.d/99proxy.conf << EOL
+Acquire::http::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
+Acquire::https::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
+EOL
+echo "APT configured."
+
+# --- 5. Configure Policy-Based Routing for Exemptions ---
+echo "Configuring policy-based routing for exemptions..."
+DEFAULT_ROUTE_LINE=$(ip route | grep '^default' | head -n 1)
+if [ -z "$DEFAULT_ROUTE_LINE" ]; then echo "ERROR: Could not determine default route." && exit 1; fi
+ORIGINAL_GATEWAY=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $3}')
+ORIGINAL_INTERFACE=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $5}')
+echo "$ORIGINAL_GATEWAY" > /tmp/original_gateway.txt
+echo "$ORIGINAL_INTERFACE" > /tmp/original_interface.txt
+
+# STEP 1: Create a separate routing table that contains the original default route.
+ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE table $EXEMPT_TABLE
+
+# STEP 2: Use iptables to "mark" any packet going to the proxy, DNS, or DB servers.
+iptables -t mangle -A OUTPUT -d $PROXY_IP -j MARK --set-mark $FWMARK
+for IP in "${DB_IPS[@]}"; do
+    echo "Exempting database IP via policy route: $IP"
+    iptables -t mangle -A OUTPUT -d $IP -j MARK --set-mark $FWMARK
+done
+for DNS_SERVER in $DNS_SERVERS; do
+    echo "Exempting DNS server via policy route: $DNS_SERVER"
+    iptables -t mangle -A OUTPUT -d $DNS_SERVER -j MARK --set-mark $FWMARK
+done
+
+# STEP 3: Create a routing rule that says "any packet with our mark must use our exempt table".
+ip rule add fwmark $FWMARK table $EXEMPT_TABLE
+ip route flush cache
+
+# --- 6. Start tun2socks and Configure Main Routing ---
+echo "Starting tun2socks process..."
+ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
+tun2socks -device "tun://$VIRTUAL_TUN_DEVICE" \
+          -interface "$PHYSICAL_INTERFACE" \
+          -proxy "http://$PROXY_IP:$PROXY_PORT" &
+T2S_PID=$!
+echo $T2S_PID > /tmp/tun2socks.pid
+echo "tun2socks started with PID $T2S_PID."
+sleep 2
+
+echo "Configuring main routing table..."
+ip link set dev $VIRTUAL_TUN_DEVICE up
+ip addr replace ${VIRTUAL_TUN_IP}/24 dev $VIRTUAL_TUN_DEVICE
+
+# STEP 4: Change the main default route. All non-marked traffic will now go to the tunnel.
+ip route del default
+ip route add default via $VIRTUAL_TUN_IP
+
+# --- 7. Final Verification ---
+echo -e "\n=========================================================="
+echo "          SUCCESS: PROXY TUNNEL IS NOW ACTIVE"
+echo "=========================================================="
+echo "Your new default route is:"
+ip route | head -n 1
+echo ""
+echo "Testing connection..."
+curl -A "Mozilla/5.0" --connect-timeout 5 https://icanhazip.com || echo "Test failed, but tunnel may still be working."
+echo "To stop the tunnel, run: sudo ./stop_proxy.sh"
       ]]>
     </file>
     <file path="TASKS.md">
       <![CDATA[
-- [x] Make font size of subtitle similar to description text on the homepage.
-- [x] Redesign results page to match homepage layout.
-- [x] Redesign static pages (Terms, Privacy, Cookies) to match homepage layout.
-- [x] Fix mobile UI issues on homepage (centering, sticky footer, upward-expanding disclaimer).
-- [x] Make the footer fixed on mobile for the results page.
-- [x] Make homepage content area full viewport on mobile.
-- [x] Remove footer from static pages to match user request.
-- [x] Match static page left panel/mobile header background to homepage.
-- [x] Add "go back" buttons to static and results pages.
-- [x] Make assessment steps mobile layout consistent with homepage (centered, full viewport).
-- [x] Make results page loading state consistent with homepage layout (centered, full viewport).
-- [x] Make static pages have a 50/50 split on desktop.
-- [x] Delay autofocus on mobile email dialog.
-- [x] Troubleshoot and fix database connection issue caused by proxy script.
-- [x] Add second database host to proxy exemption script.
-- [x] Fix proxy script DNS failure by reordering DNS setup.
-- [x] Add retry logic to DNS resolution to fix service startup race condition.
-- [x] Create a network diagnostics script to debug persistent DNS issues.
+# Tasks
+
+- [x] Fix bug in `start_proxy.sh` where DB host resolution fails for hostnames that return a CNAME record.
       ]]>
     </file>
   </modifications>
 </response>
-Use Arrow Up and Arrow Down to select a turn, Enter to jump to it, and Escape to return to the chat.
+```

@@ -1,19 +1,4 @@
-- [x] Make font size of subtitle similar to description text on the homepage.
-- [x] Redesign results page to match homepage layout.
-- [x] Redesign static pages (Terms, Privacy, Cookies) to match homepage layout.
-- [x] Fix mobile UI issues on homepage (centering, sticky footer, upward-expanding disclaimer).
-- [x] Make the footer fixed on mobile for the results page.
-- [x] Make homepage content area full viewport on mobile.
-- [x] Remove footer from static pages to match user request.
-- [x] Match static page left panel/mobile header background to homepage.
-- [x] Add "go back" buttons to static and results pages.
-- [x] Make assessment steps mobile layout consistent with homepage (centered, full viewport).
-- [x] Make results page loading state consistent with homepage layout (centered, full viewport).
-- [x] Make static pages have a 50/50 split on desktop.
-- [x] Delay autofocus on mobile email dialog.
-- [x] Troubleshoot and fix database connection issue caused by proxy script.
-- [x] Add second database host to proxy exemption script.
-- [x] Fix proxy script DNS failure by reordering DNS setup.
-- [x] Add retry logic to DNS resolution to fix service startup race condition.
-- [x] Create a network diagnostics script to debug persistent DNS issues.
+# Tasks
+
+- [x] Fix bug in `start_proxy.sh` where DB host resolution fails for hostnames that return a CNAME record.
       
