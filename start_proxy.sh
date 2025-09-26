@@ -12,7 +12,7 @@ PROXY_IP="172.16.2.254"
 PROXY_PORT="3128"
 PHYSICAL_INTERFACE="enp2s0" # Your main network card (e.g., eth0, wlan0)
 VIRTUAL_TUN_DEVICE="tun0"
-VIRTUAL_TUN_IP="192.18.255.1" # Corrected to a valid private IP range
+VIRTUAL_TUN_IP="10.0.0.1" # Use a standard RFC1918 private IP for the virtual device
 DNS_SERVERS="1.1.1.1 8.8.8.8"
 DNS_SERVERS_WITH_HOSTNAMES="1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google"
 # Add all database hosts to exempt here
@@ -115,7 +115,23 @@ Acquire::https::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
 EOL
 echo "APT configured."
 
-# --- 5. Configure Policy-Based Routing for Exemptions ---
+# --- 5. Create Virtual Device & Adjust Kernel Parameters ---
+echo "Creating virtual network device..."
+ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
+
+echo "Temporarily disabling Reverse Path Filtering to ensure policy routing works..."
+INTERFACES_TO_MODIFY=("all" "$PHYSICAL_INTERFACE" "$VIRTUAL_TUN_DEVICE")
+for iface in "${INTERFACES_TO_MODIFY[@]}"; do
+    # The device might not exist yet, so we check.
+    if [ -e "/proc/sys/net/ipv4/conf/$iface/rp_filter" ]; then
+        original_rp_filter=$(cat /proc/sys/net/ipv4/conf/$iface/rp_filter)
+        echo "$original_rp_filter" > "/tmp/rp_filter_${iface}.backup"
+        echo 0 > /proc/sys/net/ipv4/conf/$iface/rp_filter
+        echo " -> rp_filter for '$iface' set to 0 (was $original_rp_filter)"
+    fi
+done
+
+# --- 6. Configure Policy-Based Routing for Exemptions ---
 echo "Configuring policy-based routing for exemptions..."
 DEFAULT_ROUTE_LINE=$(ip route | grep '^default' | head -n 1)
 if [ -z "$DEFAULT_ROUTE_LINE" ]; then echo "ERROR: Could not determine default route." && exit 1; fi
@@ -142,11 +158,9 @@ done
 ip rule add fwmark $FWMARK table $EXEMPT_TABLE
 ip route flush cache
 
-# --- 6. Start tun2socks and Configure Main Routing ---
+# --- 7. Start tun2socks and Configure Main Routing ---
 echo "Starting tun2socks process..."
-ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
 tun2socks -device "tun://$VIRTUAL_TUN_DEVICE" \
-          -interface "$PHYSICAL_INTERFACE" \
           -proxy "http://$PROXY_IP:$PROXY_PORT" &
 T2S_PID=$!
 echo $T2S_PID > /tmp/tun2socks.pid
@@ -161,7 +175,7 @@ ip addr replace ${VIRTUAL_TUN_IP}/24 dev $VIRTUAL_TUN_DEVICE
 ip route del default
 ip route add default via $VIRTUAL_TUN_IP
 
-# --- 7. Final Verification ---
+# --- 8. Final Verification ---
 echo -e "\n=========================================================="
 echo "          SUCCESS: PROXY TUNNEL IS NOW ACTIVE"
 echo "=========================================================="

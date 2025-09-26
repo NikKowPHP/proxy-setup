@@ -1,27 +1,21 @@
 ```xml
 <response>
   <reasoning>
-    The user is reporting that `start_proxy.sh` fails during DNS resolution for a database host.
-    The error log shows: `ERROR: Could not resolve database host IP for aws-0-us-west-1.pooler.supabase.com after 5 attempts. Exiting.`
+    The user's logs confirm that the previous fix for `rp_filter` was a step in the right direction, as the `curl` test to `icanhazip.com` now succeeds, proving the main proxy tunnel is functional. However, a new, more subtle problem has emerged: network traffic that is supposed to be *exempted* from the proxy tunnel (like `ping 8.8.8.8` and direct DNS queries with `dig @1.1.1.1`) is failing.
 
-    Looking at the `diagnose_network.sh` output, DNS resolution for that host works, but it returns a CNAME record before the A (IP address) records:
-    ```
-    -> Testing resolution for PROBLEMATIC HOST 'aws-0-us-west-1.pooler.supabase.com' using system resolver:
-    pool-tcp-us-west-1-58aaa9f-fd46bdad3edd3d75.elb.us-west-1.amazonaws.com.
-    52.8.172.168
-    54.177.55.191
-    ```
+Analysis of the `diagnose_network.sh` output reveals a key contradiction:
+1.  **Exempted TCP seems to work:** The system resolver (`dig google.com`) successfully gets a response. This works by making a DNS-over-TLS (TCP) request to `1.1.1.1` or `8.8.8.8`. Since these IPs are marked for exemption, this implies the exemption path for TCP is working.
+2.  **Exempted ICMP and UDP fail:** `ping 8.8.8.8` and `dig @1.1.1.1` both time out.
 
-    The failing command in `start_proxy.sh` is:
-    `IP=$(dig +time=2 +tries=1 +short $HOST | head -n 1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')`
+This points to a problem with how non-TCP traffic is handled by the policy-based routing rules. While `rp_filter` was one cause, another likely culprit is the IP address chosen for the virtual tunnel device. The current IP, `192.18.255.1`, is part of a public IP range, not a private (RFC1918) one. Using a public IP for an internal virtual interface can confuse the kernel's routing logic.
 
-    This command takes the first line of the `dig` output (`head -n 1`) and then checks if it's an IP address. When the first line is a CNAME, the `grep` fails, and the `IP` variable remains empty, causing the script to error out.
+I will change the virtual IP to a standard private address, `10.0.0.1`, to eliminate this potential conflict. Additionally, I will remove the `-interface "$PHYSICAL_INTERFACE"` argument from the `tun2socks` command. While intended to be helpful, it can sometimes interfere with the system's default routing decisions for exempted traffic, and it's not strictly necessary when there is only one primary physical interface.
 
-    The fix is to first filter for IP addresses with `grep` and then take the first result with `head -n 1`.
-
-    My plan is:
-    1.  Modify `start_proxy.sh` to correct the `dig` command's pipe order.
-    2.  Create a `TASKS.md` file to track this task and mark it as complete, as one does not currently exist.
+My plan is to:
+1.  Modify `start_proxy.sh` to use the private IP `10.0.0.1` for `VIRTUAL_TUN_IP`.
+2.  Update the related `ip addr` and `ip route` commands to use this new IP.
+3.  Remove the `-interface` flag from the `tun2socks` command line.
+4.  Update `TASKS.md` to reflect the new fix.
   </reasoning>
   <modifications>
     <file path="start_proxy.sh">
@@ -40,7 +34,7 @@ PROXY_IP="172.16.2.254"
 PROXY_PORT="3128"
 PHYSICAL_INTERFACE="enp2s0" # Your main network card (e.g., eth0, wlan0)
 VIRTUAL_TUN_DEVICE="tun0"
-VIRTUAL_TUN_IP="192.18.255.1" # Corrected to a valid private IP range
+VIRTUAL_TUN_IP="10.0.0.1" # Use a standard RFC1918 private IP for the virtual device
 DNS_SERVERS="1.1.1.1 8.8.8.8"
 DNS_SERVERS_WITH_HOSTNAMES="1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google"
 # Add all database hosts to exempt here
@@ -143,7 +137,23 @@ Acquire::https::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
 EOL
 echo "APT configured."
 
-# --- 5. Configure Policy-Based Routing for Exemptions ---
+# --- 5. Create Virtual Device & Adjust Kernel Parameters ---
+echo "Creating virtual network device..."
+ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
+
+echo "Temporarily disabling Reverse Path Filtering to ensure policy routing works..."
+INTERFACES_TO_MODIFY=("all" "$PHYSICAL_INTERFACE" "$VIRTUAL_TUN_DEVICE")
+for iface in "${INTERFACES_TO_MODIFY[@]}"; do
+    # The device might not exist yet, so we check.
+    if [ -e "/proc/sys/net/ipv4/conf/$iface/rp_filter" ]; then
+        original_rp_filter=$(cat /proc/sys/net/ipv4/conf/$iface/rp_filter)
+        echo "$original_rp_filter" > "/tmp/rp_filter_${iface}.backup"
+        echo 0 > /proc/sys/net/ipv4/conf/$iface/rp_filter
+        echo " -> rp_filter for '$iface' set to 0 (was $original_rp_filter)"
+    fi
+done
+
+# --- 6. Configure Policy-Based Routing for Exemptions ---
 echo "Configuring policy-based routing for exemptions..."
 DEFAULT_ROUTE_LINE=$(ip route | grep '^default' | head -n 1)
 if [ -z "$DEFAULT_ROUTE_LINE" ]; then echo "ERROR: Could not determine default route." && exit 1; fi
@@ -170,11 +180,9 @@ done
 ip rule add fwmark $FWMARK table $EXEMPT_TABLE
 ip route flush cache
 
-# --- 6. Start tun2socks and Configure Main Routing ---
+# --- 7. Start tun2socks and Configure Main Routing ---
 echo "Starting tun2socks process..."
-ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
 tun2socks -device "tun://$VIRTUAL_TUN_DEVICE" \
-          -interface "$PHYSICAL_INTERFACE" \
           -proxy "http://$PROXY_IP:$PROXY_PORT" &
 T2S_PID=$!
 echo $T2S_PID > /tmp/tun2socks.pid
@@ -189,7 +197,7 @@ ip addr replace ${VIRTUAL_TUN_IP}/24 dev $VIRTUAL_TUN_DEVICE
 ip route del default
 ip route add default via $VIRTUAL_TUN_IP
 
-# --- 7. Final Verification ---
+# --- 8. Final Verification ---
 echo -e "\n=========================================================="
 echo "          SUCCESS: PROXY TUNNEL IS NOW ACTIVE"
 echo "=========================================================="
@@ -206,6 +214,8 @@ echo "To stop the tunnel, run: sudo ./stop_proxy.sh"
 # Tasks
 
 - [x] Fix bug in `start_proxy.sh` where DB host resolution fails for hostnames that return a CNAME record.
+- [x] Fix network connectivity failure by disabling Reverse Path Filtering (`rp_filter`) while the proxy is active.
+- [x] Fix exempted UDP/ICMP traffic by using a private IP for the virtual TUN device and removing the `-interface` flag from `tun2socks`.
       ]]>
     </file>
   </modifications>

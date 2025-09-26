@@ -9,6 +9,8 @@
 VIRTUAL_TUN_DEVICE="tun0"
 EXEMPT_TABLE=100
 FWMARK=1
+# This needs to match the interface in start_proxy.sh to restore rp_filter
+PHYSICAL_INTERFACE="enp2s0"
 
 # --- Pre-flight Checks ---
 if [[ $EUID -ne 0 ]]; then
@@ -48,11 +50,26 @@ ip route flush table $EXEMPT_TABLE &> /dev/null
 iptables -t mangle -F OUTPUT &> /dev/null
 ip route flush cache
 
-# --- 4. Remove Virtual Device ---
+# --- 4. Restore Kernel Parameters (Reverse Path Filtering) ---
+echo "Restoring Reverse Path Filtering settings..."
+INTERFACES_TO_RESTORE=("all" "$PHYSICAL_INTERFACE" "$VIRTUAL_TUN_DEVICE")
+for iface in "${INTERFACES_TO_RESTORE[@]}"; do
+    if [ -f "/tmp/rp_filter_${iface}.backup" ]; then
+        original_value=$(cat "/tmp/rp_filter_${iface}.backup")
+        # Check if interface exists before trying to write to it
+        if [ -e "/proc/sys/net/ipv4/conf/$iface/rp_filter" ]; then
+            echo "$original_value" > "/proc/sys/net/ipv4/conf/$iface/rp_filter"
+            echo " -> rp_filter for '$iface' restored to '$original_value'"
+        fi
+        rm "/tmp/rp_filter_${iface}.backup"
+    fi
+done
+
+# --- 5. Remove Virtual Device ---
 echo "Deleting virtual network device..."
 ip link del $VIRTUAL_TUN_DEVICE &> /dev/null
 
-# --- 5. Restore Original DNS Settings ---
+# --- 6. Restore Original DNS Settings ---
 echo "Restoring original DNS configuration..."
 if [ -f /etc/systemd/resolved.conf.backup ]; then
     mv /etc/systemd/resolved.conf.backup /etc/systemd/resolved.conf
@@ -64,10 +81,11 @@ echo "Restarting network services to apply DNS changes..."
 systemctl restart NetworkManager && systemctl restart systemd-resolved
 echo "DNS settings restored."
 
-# --- 6. Restore APT settings ---
+# --- 7. Restore APT settings ---
 if [ -f /etc/apt/apt.conf.d/99proxy.conf ]; then
     rm -f /etc/apt/apt.conf.d/99proxy.conf
     echo "APT proxy configuration removed."
 fi
 
 echo -e "\n--- Proxy Tunnel Deactivated ---"
+      

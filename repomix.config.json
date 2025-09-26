@@ -1,0 +1,7 @@
+{
+
+
+"ignore": {
+    "customPatterns": [ "docs/**", "a.md", "repomix-output.xml"]
+  }
+}
