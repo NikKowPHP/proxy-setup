@@ -55,19 +55,7 @@ ip route flush table $EXEMPT_TABLE &> /dev/null
 iptables -t mangle -F OUTPUT &> /dev/null
 echo "Cleanup complete."
 
-# --- 2. Resolve DB Hosts and Configure DNS ---
-DB_IPS=()
-for HOST in "${DB_HOSTS[@]}"; do
-    echo "Resolving database host IP for $HOST..."
-    IP=$(dig +short $HOST | head -n 1)
-    if [ -z "$IP" ]; then
-        echo "ERROR: Could not resolve database host IP for $HOST. Exiting."
-        exit 1
-    fi
-    echo "Database IP to be exempted: $IP"
-    DB_IPS+=("$IP")
-done
-
+# --- 2. Configure DNS ---
 echo "Configuring DNS for DNS-over-TLS to bypass proxy DNS issues..."
 [ ! -f /etc/systemd/resolved.conf.backup ] && cp /etc/systemd/resolved.conf /etc/systemd/resolved.conf.backup
 [ ! -f /etc/NetworkManager/NetworkManager.conf.backup ] && cp /etc/NetworkManager/NetworkManager.conf /etc/NetworkManager/NetworkManager.conf.backup
@@ -87,7 +75,30 @@ if ! (resolvectl status | grep -q '+DNSOverTLS'); then
 fi
 echo "DNS configured successfully."
 
-# --- 3. Configure APT for Proxy ---
+# --- 3. Resolve DB Hosts for Exemption ---
+DB_IPS=()
+for HOST in "${DB_HOSTS[@]}"; do
+    echo "Resolving database host IP for $HOST..."
+    IP=""
+    for i in {1..5}; do
+        # Use a timeout for dig to avoid long hangs, and grep to ensure it's a valid IP
+        IP=$(dig +time=2 +tries=1 +short $HOST | head -n 1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        if [ -n "$IP" ]; then
+            break
+        fi
+        echo "DNS resolution failed for $HOST (attempt $i/5), retrying in 2 seconds..."
+        sleep 2
+    done
+
+    if [ -z "$IP" ]; then
+        echo "ERROR: Could not resolve database host IP for $HOST after 5 attempts. Exiting."
+        exit 1
+    fi
+    echo "Database IP to be exempted: $IP"
+    DB_IPS+=("$IP")
+done
+
+# --- 4. Configure APT for Proxy ---
 echo "Configuring APT to use HTTP proxy..."
 cat > /etc/apt/apt.conf.d/99proxy.conf << EOL
 Acquire::http::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
@@ -95,7 +106,7 @@ Acquire::https::Proxy "http://${PROXY_IP}:${PROXY_PORT}";
 EOL
 echo "APT configured."
 
-# --- 4. Configure Policy-Based Routing for Exemptions ---
+# --- 5. Configure Policy-Based Routing for Exemptions ---
 echo "Configuring policy-based routing for exemptions..."
 DEFAULT_ROUTE_LINE=$(ip route | grep '^default' | head -n 1)
 if [ -z "$DEFAULT_ROUTE_LINE" ]; then echo "ERROR: Could not determine default route." && exit 1; fi
@@ -122,7 +133,7 @@ done
 ip rule add fwmark $FWMARK table $EXEMPT_TABLE
 ip route flush cache
 
-# --- 5. Start tun2socks and Configure Main Routing ---
+# --- 6. Start tun2socks and Configure Main Routing ---
 echo "Starting tun2socks process..."
 ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
 tun2socks -device "tun://$VIRTUAL_TUN_DEVICE" \
@@ -141,7 +152,7 @@ ip addr replace ${VIRTUAL_TUN_IP}/24 dev $VIRTUAL_TUN_DEVICE
 ip route del default
 ip route add default via $VIRTUAL_TUN_IP
 
-# --- 6. Final Verification ---
+# --- 7. Final Verification ---
 echo -e "\n=========================================================="
 echo "          SUCCESS: PROXY TUNNEL IS NOW ACTIVE"
 echo "=========================================================="
@@ -151,3 +162,4 @@ echo ""
 echo "Testing connection..."
 curl -A "Mozilla/5.0" --connect-timeout 5 https://icanhazip.com || echo "Test failed, but tunnel may still be working."
 echo "To stop the tunnel, run: sudo ./stop_proxy.sh"
+      

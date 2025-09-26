@@ -13,3 +13,7 @@
 - [x] Delay autofocus on mobile email dialog.
 - [x] Troubleshoot and fix database connection issue caused by proxy script.
 - [x] Add second database host to proxy exemption script.
+- [x] Fix proxy script DNS failure by reordering DNS setup.
+- [x] Add retry logic to DNS resolution to fix service startup race condition.
+- [x] Create a network diagnostics script to debug persistent DNS issues.
+      

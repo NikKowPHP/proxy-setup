@@ -1,5 +1,6 @@
 .gitignore
 apply_changes.sh
+diagnose_network.sh
 start_proxy.sh
 stop_proxy.sh
 TASKS.md
