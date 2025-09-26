@@ -21,10 +21,6 @@ DB_HOSTS=(
   "aws-0-eu-central-1.pooler.supabase.com"
 )
 
-# --- Advanced Routing Configuration ---
-EXEMPT_TABLE=100 # Routing table number for exemptions
-FWMARK=1         # Firewall mark for exempted packets
-
 # --- Pre-flight Checks ---
 if [[ $EUID -ne 0 ]]; then
    echo "This script must be run as root. Please use 'sudo ./start_proxy.sh'"
@@ -59,8 +55,9 @@ if [ -f /tmp/tun2socks.pid ]; then
     rm -f /tmp/tun2socks.pid
 fi
 ip link del $VIRTUAL_TUN_DEVICE &> /dev/null
-ip rule del fwmark $FWMARK table $EXEMPT_TABLE &> /dev/null
-ip route flush table $EXEMPT_TABLE &> /dev/null
+# Clean up old policy routing rules in case they are left over
+ip rule del priority 500 &> /dev/null
+ip route flush table 100 &> /dev/null
 iptables -t mangle -F OUTPUT &> /dev/null
 echo "Cleanup complete."
 
@@ -119,7 +116,7 @@ echo "APT configured."
 echo "Creating virtual network device..."
 ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
 
-echo "Temporarily disabling Reverse Path Filtering to ensure policy routing works..."
+echo "Temporarily disabling Reverse Path Filtering to ensure routing works..."
 INTERFACES_TO_MODIFY=("all" "$PHYSICAL_INTERFACE" "$VIRTUAL_TUN_DEVICE")
 for iface in "${INTERFACES_TO_MODIFY[@]}"; do
     # The device might not exist yet, so we check.
@@ -131,8 +128,8 @@ for iface in "${INTERFACES_TO_MODIFY[@]}"; do
     fi
 done
 
-# --- 6. Configure Policy-Based Routing for Exemptions ---
-echo "Configuring policy-based routing for exemptions..."
+# --- 6. Configure Routing for Exemptions ---
+echo "Configuring direct routing for exemptions..."
 DEFAULT_ROUTE_LINE=$(ip route | grep '^default' | head -n 1)
 if [ -z "$DEFAULT_ROUTE_LINE" ]; then echo "ERROR: Could not determine default route." && exit 1; fi
 ORIGINAL_GATEWAY=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $3}')
@@ -140,23 +137,24 @@ ORIGINAL_INTERFACE=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $5}')
 echo "$ORIGINAL_GATEWAY" > /tmp/original_gateway.txt
 echo "$ORIGINAL_INTERFACE" > /tmp/original_interface.txt
 
-# STEP 1: Create a separate routing table that contains the original default route.
-ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE table $EXEMPT_TABLE
+# Create a list of all unique IPs to exempt
+EXEMPT_IPS=()
+EXEMPT_IPS+=("$PROXY_IP")
+EXEMPT_IPS+=($DNS_SERVERS)
+EXEMPT_IPS+=("${DB_IPS[@]}")
+UNIQUE_EXEMPT_IPS=($(echo "${EXEMPT_IPS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
 
-# STEP 2: Use iptables to "mark" any packet going to the proxy, DNS, or DB servers.
-iptables -t mangle -A OUTPUT -d $PROXY_IP -j MARK --set-mark $FWMARK
-for IP in "${DB_IPS[@]}"; do
-    echo "Exempting database IP via policy route: $IP"
-    iptables -t mangle -A OUTPUT -d $IP -j MARK --set-mark $FWMARK
-done
-for DNS_SERVER in $DNS_SERVERS; do
-    echo "Exempting DNS server via policy route: $DNS_SERVER"
-    iptables -t mangle -A OUTPUT -d $DNS_SERVER -j MARK --set-mark $FWMARK
-done
+# Use a temporary file to track routes we add so they can be removed cleanly
+ROUTE_FILE="/tmp/proxy_added_routes.txt"
+> "$ROUTE_FILE" # Clear the file
 
-# STEP 3: Create a routing rule that says "any packet with our mark must use our exempt table".
-ip rule add fwmark $FWMARK table $EXEMPT_TABLE
-ip route flush cache
+# Add specific, high-priority routes for exempt IPs
+echo "Adding specific routes for services to bypass the tunnel..."
+for IP in "${UNIQUE_EXEMPT_IPS[@]}"; do
+    echo "-> Exempting $IP via direct route"
+    ip route add "$IP" via "$ORIGINAL_GATEWAY"
+    echo "$IP" >> "$ROUTE_FILE"
+done
 
 # --- 7. Start tun2socks and Configure Main Routing ---
 echo "Starting tun2socks process..."
@@ -171,9 +169,10 @@ echo "Configuring main routing table..."
 ip link set dev $VIRTUAL_TUN_DEVICE up
 ip addr replace ${VIRTUAL_TUN_IP}/24 dev $VIRTUAL_TUN_DEVICE
 
-# STEP 4: Change the main default route. All non-marked traffic will now go to the tunnel.
+# Change the main default route. All non-exempted traffic will now go to the tunnel.
 ip route del default
 ip route add default via $VIRTUAL_TUN_IP
+ip route flush cache
 
 # --- 8. Final Verification ---
 echo -e "\n=========================================================="
@@ -185,4 +184,3 @@ echo ""
 echo "Testing connection..."
 curl -A "Mozilla/5.0" --connect-timeout 5 https://icanhazip.com || echo "Test failed, but tunnel may still be working."
 echo "To stop the tunnel, run: sudo ./stop_proxy.sh"
-      

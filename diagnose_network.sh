@@ -36,6 +36,12 @@ echo
 echo "-> Kernel Routing Table (ip route):"
 ip route
 echo
+echo "-> Policy Routing Rules (ip rule list):"
+ip rule list
+echo
+echo "-> Exemption Routing Table (ip route show table 100):"
+ip route show table 100
+echo
 echo "-> Pinging external IP (8.8.8.8) to test basic connectivity (bypasses DNS):"
 ping -c 3 8.8.8.8
 

@@ -1,25 +1,23 @@
-```xml
-<response>
-  <reasoning>
-    The user's logs confirm that the previous fix for `rp_filter` was a step in the right direction, as the `curl` test to `icanhazip.com` now succeeds, proving the main proxy tunnel is functional. However, a new, more subtle problem has emerged: network traffic that is supposed to be *exempted* from the proxy tunnel (like `ping 8.8.8.8` and direct DNS queries with `dig @1.1.1.1`) is failing.
+<reasoning>
+The user is experiencing a total loss of connectivity after running `start_proxy.sh`. The diagnostic script shows that even basic connectivity tests like `ping 8.8.8.8` and all DNS lookups are failing.
 
-Analysis of the `diagnose_network.sh` output reveals a key contradiction:
-1.  **Exempted TCP seems to work:** The system resolver (`dig google.com`) successfully gets a response. This works by making a DNS-over-TLS (TCP) request to `1.1.1.1` or `8.8.8.8`. Since these IPs are marked for exemption, this implies the exemption path for TCP is working.
-2.  **Exempted ICMP and UDP fail:** `ping 8.8.8.8` and `dig @1.1.1.1` both time out.
+My analysis of the diagnostic output points to a failure in the policy-based routing used for exemptions. The current method uses `iptables` to mark packets destined for the proxy, DNS, and database servers, and then uses `ip rule` to direct these marked packets to a separate routing table (`100`) that contains the original default gateway.
 
-This points to a problem with how non-TCP traffic is handled by the policy-based routing rules. While `rp_filter` was one cause, another likely culprit is the IP address chosen for the virtual tunnel device. The current IP, `192.18.255.1`, is part of a public IP range, not a private (RFC1918) one. Using a public IP for an internal virtual interface can confuse the kernel's routing logic.
+This complex setup appears to be failing. A likely cause is that the network's gateway (which is also the proxy server) has a restrictive firewall policy, dropping the exempted packets (like DNS-over-TLS or ping) that are not destined for the proxy port.
 
-I will change the virtual IP to a standard private address, `10.0.0.1`, to eliminate this potential conflict. Additionally, I will remove the `-interface "$PHYSICAL_INTERFACE"` argument from the `tun2socks` command. While intended to be helpful, it can sometimes interfere with the system's default routing decisions for exempted traffic, and it's not strictly necessary when there is only one primary physical interface.
+To fix this, I will refactor the routing logic in `start_proxy.sh` and `stop_proxy.sh` to use a simpler, more direct, and more robust method for exemptions:
 
-My plan is to:
-1.  Modify `start_proxy.sh` to use the private IP `10.0.0.1` for `VIRTUAL_TUN_IP`.
-2.  Update the related `ip addr` and `ip route` commands to use this new IP.
-3.  Remove the `-interface` flag from the `tun2socks` command line.
-4.  Update `TASKS.md` to reflect the new fix.
-  </reasoning>
-  <modifications>
-    <file path="start_proxy.sh">
-      <![CDATA[
+1.  **Eliminate Policy-Based Routing:** I will remove the use of `iptables` marking (`fwmark`), `ip rule`, and the separate exemption routing table.
+2.  **Implement Direct Routing:** Instead, I will add specific host routes (e.g., `/32`) for the proxy, DNS, and database server IPs before changing the main default route. These specific routes will point to the original network gateway. Because specific routes are preferred over the default route, this will ensure that traffic to these critical services bypasses the `tun0` tunnel correctly without needing complex marking and policy rules.
+3.  **Update Cleanup Logic:** The `stop_proxy.sh` script will be updated to remove these specific routes upon deactivation. I will also keep the old cleanup commands in both scripts to ensure a smooth transition and proper cleanup if the scripts are used on a system configured with the previous version.
+
+This change will simplify the networking logic, make it easier to debug, and should resolve the connectivity failure by using a more standard routing mechanism for exemptions.
+
+I will modify `start_proxy.sh` and `stop_proxy.sh`.
+</reasoning>
+<modifications>
+<file path="start_proxy.sh">
+  <![CDATA[
 #!/bin/bash
 
 # ==============================================================================
@@ -42,10 +40,6 @@ DB_HOSTS=(
   "aws-0-us-west-1.pooler.supabase.com"
   "aws-0-eu-central-1.pooler.supabase.com"
 )
-
-# --- Advanced Routing Configuration ---
-EXEMPT_TABLE=100 # Routing table number for exemptions
-FWMARK=1         # Firewall mark for exempted packets
 
 # --- Pre-flight Checks ---
 if [[ $EUID -ne 0 ]]; then
@@ -81,8 +75,9 @@ if [ -f /tmp/tun2socks.pid ]; then
     rm -f /tmp/tun2socks.pid
 fi
 ip link del $VIRTUAL_TUN_DEVICE &> /dev/null
-ip rule del fwmark $FWMARK table $EXEMPT_TABLE &> /dev/null
-ip route flush table $EXEMPT_TABLE &> /dev/null
+# Clean up old policy routing rules in case they are left over
+ip rule del priority 500 &> /dev/null
+ip route flush table 100 &> /dev/null
 iptables -t mangle -F OUTPUT &> /dev/null
 echo "Cleanup complete."
 
@@ -141,7 +136,7 @@ echo "APT configured."
 echo "Creating virtual network device..."
 ip tuntap add dev $VIRTUAL_TUN_DEVICE mode tun
 
-echo "Temporarily disabling Reverse Path Filtering to ensure policy routing works..."
+echo "Temporarily disabling Reverse Path Filtering to ensure routing works..."
 INTERFACES_TO_MODIFY=("all" "$PHYSICAL_INTERFACE" "$VIRTUAL_TUN_DEVICE")
 for iface in "${INTERFACES_TO_MODIFY[@]}"; do
     # The device might not exist yet, so we check.
@@ -153,8 +148,8 @@ for iface in "${INTERFACES_TO_MODIFY[@]}"; do
     fi
 done
 
-# --- 6. Configure Policy-Based Routing for Exemptions ---
-echo "Configuring policy-based routing for exemptions..."
+# --- 6. Configure Routing for Exemptions ---
+echo "Configuring direct routing for exemptions..."
 DEFAULT_ROUTE_LINE=$(ip route | grep '^default' | head -n 1)
 if [ -z "$DEFAULT_ROUTE_LINE" ]; then echo "ERROR: Could not determine default route." && exit 1; fi
 ORIGINAL_GATEWAY=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $3}')
@@ -162,23 +157,24 @@ ORIGINAL_INTERFACE=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $5}')
 echo "$ORIGINAL_GATEWAY" > /tmp/original_gateway.txt
 echo "$ORIGINAL_INTERFACE" > /tmp/original_interface.txt
 
-# STEP 1: Create a separate routing table that contains the original default route.
-ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE table $EXEMPT_TABLE
+# Create a list of all unique IPs to exempt
+EXEMPT_IPS=()
+EXEMPT_IPS+=("$PROXY_IP")
+EXEMPT_IPS+=($DNS_SERVERS)
+EXEMPT_IPS+=("${DB_IPS[@]}")
+UNIQUE_EXEMPT_IPS=($(echo "${EXEMPT_IPS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
 
-# STEP 2: Use iptables to "mark" any packet going to the proxy, DNS, or DB servers.
-iptables -t mangle -A OUTPUT -d $PROXY_IP -j MARK --set-mark $FWMARK
-for IP in "${DB_IPS[@]}"; do
-    echo "Exempting database IP via policy route: $IP"
-    iptables -t mangle -A OUTPUT -d $IP -j MARK --set-mark $FWMARK
-done
-for DNS_SERVER in $DNS_SERVERS; do
-    echo "Exempting DNS server via policy route: $DNS_SERVER"
-    iptables -t mangle -A OUTPUT -d $DNS_SERVER -j MARK --set-mark $FWMARK
-done
+# Use a temporary file to track routes we add so they can be removed cleanly
+ROUTE_FILE="/tmp/proxy_added_routes.txt"
+> "$ROUTE_FILE" # Clear the file
 
-# STEP 3: Create a routing rule that says "any packet with our mark must use our exempt table".
-ip rule add fwmark $FWMARK table $EXEMPT_TABLE
-ip route flush cache
+# Add specific, high-priority routes for exempt IPs
+echo "Adding specific routes for services to bypass the tunnel..."
+for IP in "${UNIQUE_EXEMPT_IPS[@]}"; do
+    echo "-> Exempting $IP via direct route"
+    ip route add "$IP" via "$ORIGINAL_GATEWAY"
+    echo "$IP" >> "$ROUTE_FILE"
+done
 
 # --- 7. Start tun2socks and Configure Main Routing ---
 echo "Starting tun2socks process..."
@@ -193,9 +189,10 @@ echo "Configuring main routing table..."
 ip link set dev $VIRTUAL_TUN_DEVICE up
 ip addr replace ${VIRTUAL_TUN_IP}/24 dev $VIRTUAL_TUN_DEVICE
 
-# STEP 4: Change the main default route. All non-marked traffic will now go to the tunnel.
+# Change the main default route. All non-exempted traffic will now go to the tunnel.
 ip route del default
 ip route add default via $VIRTUAL_TUN_IP
+ip route flush cache
 
 # --- 8. Final Verification ---
 echo -e "\n=========================================================="
@@ -207,17 +204,115 @@ echo ""
 echo "Testing connection..."
 curl -A "Mozilla/5.0" --connect-timeout 5 https://icanhazip.com || echo "Test failed, but tunnel may still be working."
 echo "To stop the tunnel, run: sudo ./stop_proxy.sh"
-      ]]>
-    </file>
-    <file path="TASKS.md">
-      <![CDATA[
-# Tasks
+]]>
+</file>
+<file path="stop_proxy.sh">
+  <![CDATA[
+#!/bin/bash
 
-- [x] Fix bug in `start_proxy.sh` where DB host resolution fails for hostnames that return a CNAME record.
-- [x] Fix network connectivity failure by disabling Reverse Path Filtering (`rp_filter`) while the proxy is active.
-- [x] Fix exempted UDP/ICMP traffic by using a private IP for the virtual TUN device and removing the `-interface` flag from `tun2socks`.
-      ]]>
-    </file>
-  </modifications>
+# ==============================================================================
+#           TUN2SOCKS - System-Wide Proxy Tunnel Stop Script
+# ==============================================================================
+# This script reverts all changes made by start_proxy.sh.
+
+# --- Script Configuration ---
+VIRTUAL_TUN_DEVICE="tun0"
+# This needs to match the interface in start_proxy.sh to restore rp_filter
+PHYSICAL_INTERFACE="enp2s0"
+
+# --- Pre-flight Checks ---
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root. Please use 'sudo ./stop_proxy.sh'"
+   exit 1
+fi
+
+echo "--- Stopping System-Wide Proxy Tunnel ---"
+
+# --- 1. Kill tun2socks ---
+if [ -f /tmp/tun2socks.pid ]; then
+    echo "Stopping tun2socks process..."
+    kill $(cat /tmp/tun2socks.pid) &> /dev/null
+    rm -f /tmp/tun2socks.pid
+else
+    echo "tun2socks PID file not found. It might already be stopped."
+fi
+
+# --- 2. Restore Routing ---
+echo "Restoring original network routes..."
+
+# Delete specific routes added by start script
+ROUTE_FILE="/tmp/proxy_added_routes.txt"
+if [ -f "$ROUTE_FILE" ]; then
+    echo "Removing specific exemption routes..."
+    while IFS= read -r IP; do
+        if [ -n "$IP" ]; then
+            echo " -> Deleting route for $IP"
+            ip route del "$IP" &> /dev/null
+        fi
+    done < "$ROUTE_FILE"
+    rm -f "$ROUTE_FILE"
+fi
+
+if [ -f /tmp/original_gateway.txt ] && [ -f /tmp/original_interface.txt ]; then
+    ORIGINAL_GATEWAY=$(cat /tmp/original_gateway.txt)
+    ORIGINAL_INTERFACE=$(cat /tmp/original_interface.txt)
+    ip route del default &> /dev/null
+    ip route add default via $ORIGINAL_GATEWAY dev $ORIGINAL_INTERFACE
+    rm -f /tmp/original_gateway.txt /tmp/original_interface.txt
+    echo "Default route restored."
+else
+    echo "WARNING: Original gateway information not found. You may need to restore the default route manually."
+    echo "Example: sudo ip route add default via <YOUR_GATEWAY_IP> dev <YOUR_INTERFACE>"
+fi
+ip route flush cache
+
+# --- 3. Clean up old Policy Routing and Firewall Rules ---
+echo "Cleaning up old policy routing rules and iptables marks (if any)..."
+# These commands are kept for backward compatibility to clean up a system
+# configured with an older version of the start script.
+ip rule del priority 500 &> /dev/null
+ip route flush table 100 &> /dev/null
+iptables -t mangle -F OUTPUT &> /dev/null
+
+# --- 4. Restore Kernel Parameters (Reverse Path Filtering) ---
+echo "Restoring Reverse Path Filtering settings..."
+INTERFACES_TO_RESTORE=("all" "$PHYSICAL_INTERFACE" "$VIRTUAL_TUN_DEVICE")
+for iface in "${INTERFACES_TO_RESTORE[@]}"; do
+    if [ -f "/tmp/rp_filter_${iface}.backup" ]; then
+        original_value=$(cat "/tmp/rp_filter_${iface}.backup")
+        # Check if interface exists before trying to write to it
+        if [ -e "/proc/sys/net/ipv4/conf/$iface/rp_filter" ]; then
+            echo "$original_value" > "/proc/sys/net/ipv4/conf/$iface/rp_filter"
+            echo " -> rp_filter for '$iface' restored to '$original_value'"
+        fi
+        rm "/tmp/rp_filter_${iface}.backup"
+    fi
+done
+
+# --- 5. Remove Virtual Device ---
+echo "Deleting virtual network device..."
+ip link del $VIRTUAL_TUN_DEVICE &> /dev/null
+
+# --- 6. Restore Original DNS Settings ---
+echo "Restoring original DNS configuration..."
+if [ -f /etc/systemd/resolved.conf.backup ]; then
+    mv /etc/systemd/resolved.conf.backup /etc/systemd/resolved.conf
+fi
+if [ -f /etc/NetworkManager/NetworkManager.conf.backup ]; then
+    mv /etc/NetworkManager/NetworkManager.conf.backup /etc/NetworkManager/NetworkManager.conf
+fi
+echo "Restarting network services to apply DNS changes..."
+systemctl restart NetworkManager && systemctl restart systemd-resolved
+echo "DNS settings restored."
+
+# --- 7. Restore APT settings ---
+if [ -f /etc/apt/apt.conf.d/99proxy.conf ]; then
+    rm -f /etc/apt/apt.conf.d/99proxy.conf
+    echo "APT proxy configuration removed."
+fi
+
+echo -e "\n--- Proxy Tunnel Deactivated ---"
+]]>
+</file>
+</modifications>
 </response>
-```

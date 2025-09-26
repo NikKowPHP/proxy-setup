@@ -7,8 +7,6 @@
 
 # --- Script Configuration ---
 VIRTUAL_TUN_DEVICE="tun0"
-EXEMPT_TABLE=100
-FWMARK=1
 # This needs to match the interface in start_proxy.sh to restore rp_filter
 PHYSICAL_INTERFACE="enp2s0"
 
@@ -31,6 +29,20 @@ fi
 
 # --- 2. Restore Routing ---
 echo "Restoring original network routes..."
+
+# Delete specific routes added by start script
+ROUTE_FILE="/tmp/proxy_added_routes.txt"
+if [ -f "$ROUTE_FILE" ]; then
+    echo "Removing specific exemption routes..."
+    while IFS= read -r IP; do
+        if [ -n "$IP" ]; then
+            echo " -> Deleting route for $IP"
+            ip route del "$IP" &> /dev/null
+        fi
+    done < "$ROUTE_FILE"
+    rm -f "$ROUTE_FILE"
+fi
+
 if [ -f /tmp/original_gateway.txt ] && [ -f /tmp/original_interface.txt ]; then
     ORIGINAL_GATEWAY=$(cat /tmp/original_gateway.txt)
     ORIGINAL_INTERFACE=$(cat /tmp/original_interface.txt)
@@ -42,13 +54,15 @@ else
     echo "WARNING: Original gateway information not found. You may need to restore the default route manually."
     echo "Example: sudo ip route add default via <YOUR_GATEWAY_IP> dev <YOUR_INTERFACE>"
 fi
-
-# --- 3. Remove Policy Routing and Firewall Rules ---
-echo "Removing policy routing rules and iptables marks..."
-ip rule del fwmark $FWMARK table $EXEMPT_TABLE &> /dev/null
-ip route flush table $EXEMPT_TABLE &> /dev/null
-iptables -t mangle -F OUTPUT &> /dev/null
 ip route flush cache
+
+# --- 3. Clean up old Policy Routing and Firewall Rules ---
+echo "Cleaning up old policy routing rules and iptables marks (if any)..."
+# These commands are kept for backward compatibility to clean up a system
+# configured with an older version of the start script.
+ip rule del priority 500 &> /dev/null
+ip route flush table 100 &> /dev/null
+iptables -t mangle -F OUTPUT &> /dev/null
 
 # --- 4. Restore Kernel Parameters (Reverse Path Filtering) ---
 echo "Restoring Reverse Path Filtering settings..."
@@ -88,4 +102,3 @@ if [ -f /etc/apt/apt.conf.d/99proxy.conf ]; then
 fi
 
 echo -e "\n--- Proxy Tunnel Deactivated ---"
-      
