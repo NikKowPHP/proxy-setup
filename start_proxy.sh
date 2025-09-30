@@ -28,12 +28,23 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 if ! ip route | grep -q '^default'; then
-    echo "CRITICAL ERROR: No default gateway found on your system."
-    echo "This script requires a working internet connection to start."
-    echo "Please restore your default route and try again."
-    echo "You can check your routes with: ip route"
-    echo "You may be able to fix this temporarily with: sudo ip route add default via <GATEWAY_IP> dev <INTERFACE>"
-    exit 1
+    echo "WARNING: No default gateway found. Attempting to restore it using the proxy IP as the gateway."
+    
+    # Attempt to add the default route. We assume the PROXY_IP is the gateway.
+    ip route add default via "$PROXY_IP" dev "$PHYSICAL_INTERFACE"
+    
+    # Give the network a moment to apply the change
+    sleep 1 
+    
+    # Verify that the fix worked by pinging a reliable external IP
+    if ping -c 1 -W 3 8.8.8.8 &> /dev/null; then
+        echo "SUCCESS: Default route has been restored. Continuing script..."
+    else
+        echo "CRITICAL ERROR: Failed to restore the default route automatically."
+        echo "The command 'ip route add default via $PROXY_IP dev $PHYSICAL_INTERFACE' did not establish a working connection."
+        echo "Please check your physical network connection and try again."
+        exit 1
+    fi
 fi
 
 if ! command -v tun2socks &> /dev/null; then
