@@ -95,24 +95,21 @@ echo "DNS configured successfully."
 # --- 3. Resolve DB Hosts for Exemption ---
 DB_IPS=()
 for HOST in "${DB_HOSTS[@]}"; do
-    echo "Resolving database host IP for $HOST..."
-    IP=""
-    for i in {1..5}; do
-        # Use a timeout for dig to avoid long hangs, and grep for an IP before taking the first line.
-        IP=$(dig +time=2 +tries=1 +short $HOST | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
-        if [ -n "$IP" ]; then
-            break
-        fi
-        echo "DNS resolution failed for $HOST (attempt $i/5), retrying in 2 seconds..."
-        sleep 2
-    done
-
-    if [ -z "$IP" ]; then
-        echo "ERROR: Could not resolve database host IP for $HOST after 5 attempts. Exiting."
+    echo "Resolving database host IPs for $HOST..."
+    
+    # Run dig, capture all output, filter for valid IPv4 addresses
+    # We do NOT use 'head -n 1' here because we want ALL IPs associated with the load balancer
+    RESOLVED_IPS=$(dig +time=2 +tries=1 +short $HOST | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    if [ -n "$RESOLVED_IPS" ]; then
+        # Loop over the newline-separated list of IPs
+        while IFS= read -r IP; do
+            echo "Database IP to be exempted: $IP"
+            DB_IPS+=("$IP")
+        done <<< "$RESOLVED_IPS"
+    else
+        echo "ERROR: Could not resolve database host IP for $HOST. Exiting."
         exit 1
     fi
-    echo "Database IP to be exempted: $IP"
-    DB_IPS+=("$IP")
 done
 
 # --- 4. Configure APT for Proxy ---
