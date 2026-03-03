@@ -19,6 +19,7 @@ DNS_SERVERS_WITH_HOSTNAMES="1.1.1.1#cloudflare-dns.com 8.8.8.8#dns.google"
 DB_HOSTS=(
   "aws-0-us-west-1.pooler.supabase.com"
   "aws-0-eu-central-1.pooler.supabase.com"
+  "oscdn.apple.com"
 )
 
 # --- Pre-flight Checks ---
