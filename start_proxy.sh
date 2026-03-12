@@ -22,6 +22,11 @@ DB_HOSTS=(
   "oscdn.apple.com"
 )
 
+# Add extra IPs to exempt (e.g., SSH servers that block proxy traffic)
+EXTRA_EXEMPT_IPS=(
+  "185.204.216.66"
+)
+
 # --- Pre-flight Checks ---
 if [[ $EUID -ne 0 ]]; then
    echo "This script must be run as root. Please use 'sudo ./start_proxy.sh'"
@@ -189,7 +194,7 @@ ORIGINAL_INTERFACE=$(echo "$DEFAULT_ROUTE_LINE" | awk '{print $5}')
 echo "$ORIGINAL_GATEWAY" > /tmp/original_gateway.txt
 echo "$ORIGINAL_INTERFACE" > /tmp/original_interface.txt
 
-EXEMPT_IPS=("$PROXY_IP" $DNS_SERVERS "${DB_IPS[@]}")
+EXEMPT_IPS=("$PROXY_IP" $DNS_SERVERS "${DB_IPS[@]}" "${EXTRA_EXEMPT_IPS[@]}")
 UNIQUE_EXEMPT_IPS=($(echo "${EXEMPT_IPS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
 
 ROUTE_FILE="/tmp/proxy_added_routes.txt"
